@@ -1,0 +1,145 @@
+---
+title: "SM64 Decompilation: Introduction and Quickstart"
+description: "An overview of the SM64 decompilation project, what it lets you do, and how to build any of the five supported ROM versions from source."
+---
+
+The SM64 decompilation project is a fully hand-decompiled C source reconstruction of Super Mario 64. The codebase reproduces byte-for-byte matching ROMs for all five official releases of the game: Japan, North America, Europe, Shindou, and iQue Player. Naming and documentation of source code structures are ongoing. The project is the foundation for ports, mods, and research into how the original game works.
+
+## What you can do with it
+
+- Read and modify the original game logic in C
+- Build a matching ROM from any of the five supported versions
+- Apply patches or enhancements via the `enhancements/` directory
+- Port the engine to non-N64 targets by disabling `TARGET_N64`
+- Study the rendering, physics, audio, and object systems as they were shipped
+
+## Supported ROM versions
+
+Each version of the game has a unique SHA1 hash. When you build, the output is compared against the original ROM to confirm a match.
+
+| Version | Description | Output file | SHA1 |
+|---------|-------------|-------------|------|
+| `us` | 1996 North America (default) | `sm64.us.z64` | `9bef1128717f958171a4afac3ed78ee2bb4e86ce` |
+| `jp` | 1996 Japan | `sm64.jp.z64` | `8a20a5c83d6ceb0f0506cfc9fa20d8f438cafe51` |
+| `eu` | 1997 PAL Europe | `sm64.eu.z64` | `4ac5721683d0e0b6bbb561b58a71740845dceea9` |
+| `sh` | 1997 Japan Shindou (Rumble Pak) | `sm64.sh.z64` | `3f319ae697533a255a1003d09202379d78d5a2e0` |
+| `cn` | 2003 iQue Player (China) | `sm64.cn.z64` | `2e1db2780985a1f068077dc0444b685f39cd90ec` |
+
+## Prerequisites
+
+The build system requires the following packages:
+
+- **binutils-mips** — MIPS cross-assembler and linker (e.g. `binutils-mips-linux-gnu` on Debian/Ubuntu, `mips64-elf-binutils` on Arch AUR, `mips64-linux-gnu-` on RHEL/Fedora)
+- **python3** — version 3.6 or later, used by asset extraction scripts
+- **pkgconf** — package configuration tool used by the Makefile
+- **build-essential** — standard C compiler toolchain (gcc, make, etc.)
+
+<Note>
+  The repository does not include game assets. You must supply a legally obtained original ROM named `baserom.<VERSION>.z64` and place it in the project root before building. The build system extracts assets from this file automatically.
+</Note>
+
+## Build steps (Linux / Ubuntu)
+
+<Steps>
+  <Step title="Install dependencies">
+    On Debian or Ubuntu:
+
+    ```bash
+    sudo apt install -y binutils-mips-linux-gnu build-essential git pkgconf python3
+    ```
+
+    On Arch Linux:
+
+    ```bash
+    sudo pacman -S base-devel python
+    # then install mips64-elf-binutils from AUR
+    ```
+  </Step>
+
+  <Step title="Clone the repository">
+    Clone from within a Linux shell. Keep the full path under 255 characters — longer paths cause build failures.
+
+    ```bash
+    git clone https://github.com/n64decomp/sm64.git
+    cd sm64
+    ```
+  </Step>
+
+  <Step title="Place your baserom">
+    Copy your original ROM into the project root, named to match the version you want to build:
+
+    ```bash
+    # For the North American version:
+    cp /path/to/your/rom.z64 ./baserom.us.z64
+
+    # For the Japanese version:
+    cp /path/to/your/rom.z64 ./baserom.jp.z64
+    ```
+
+    Supported version names: `us`, `jp`, `eu`, `sh`, `cn`.
+  </Step>
+
+  <Step title="Build the ROM">
+    Run `make` to build the US version (the default):
+
+    ```bash
+    make
+    ```
+
+    To build a different version or use parallel jobs:
+
+    ```bash
+    make VERSION=jp -j4        # Japanese version, 4 parallel jobs
+    make VERSION=eu COMPARE=0  # PAL version, skip ROM hash comparison
+    make VERSION=sh -j4        # Shindou version with Rumble Pak support
+    make VERSION=cn -j4        # iQue Player version
+    ```
+
+    The resulting ROM is written to `build/`.
+  </Step>
+</Steps>
+
+## Build variables
+
+The Makefile exposes several variables you can set on the command line:
+
+| Variable | Default | Options | Description |
+|----------|---------|---------|-------------|
+| `VERSION` | `us` | `jp`, `us`, `eu`, `sh`, `cn` | Which ROM version to build |
+| `GRUCODE` | version-dependent | `f3d_old`, `f3d_new`, `f3dex`, `f3dex2`, `f3dzex` | RSP graphics microcode to use |
+| `COMPARE` | `1` | `0`, `1` | Whether to compare the output ROM against the known SHA1 hash |
+| `NON_MATCHING` | — | — | Use functionally equivalent C where exact assembly match is not yet achieved |
+| `CROSS` | — | e.g. `mips64-elf-` | Cross-compiler prefix override |
+
+<Tip>
+  `jp` and `us` versions default to `f3d_old` microcode and `-g` optimization. `eu`, `sh`, and `cn` use `f3d_new` and `-O2`. Setting `GRUCODE` to `f3dex2` or `f3dzex` is useful for ports targeting more capable renderers.
+</Tip>
+
+## macOS
+
+Install [Homebrew](https://brew.sh) and the required packages, then use `gmake` instead of `make` (the macOS-bundled `make` is too old):
+
+```bash
+brew update
+brew install coreutils make pkg-config tehzz/n64-dev/mips64-elf-binutils
+gmake VERSION=us -j4
+```
+
+## Docker
+
+If you prefer not to install dependencies directly, you can build using Docker:
+
+```bash
+# Build the image (once)
+docker build -t sm64 .
+
+# Build the ROM (Linux)
+docker run --rm --mount type=bind,source="$(pwd)",destination=/sm64 \
+  --user $UID:$GID sm64 make VERSION=us -j4
+
+# Build the ROM (macOS)
+docker run --rm --mount type=bind,source="$(pwd)",destination=/sm64 \
+  sm64 make VERSION=us -j4
+```
+
+Output is placed in the `build/` directory inside the mounted folder.

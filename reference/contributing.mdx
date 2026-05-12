@@ -1,0 +1,226 @@
+---
+title: "Contributing to the SM64 decompilation project"
+description: "Contributing to n64decomp/sm64: clang-format style, matching verification with diff.py, PR etiquette, and which contribution types move the project forward."
+---
+
+The SM64 decompilation is a community effort to produce a byte-identical C rebuild of the original game. Pull requests are welcome — this page explains everything you need to know before opening one, from code formatting rules to how matching is verified and what kinds of contributions have the most impact.
+
+<Note>
+  Join the community on Discord at **discord.gg/DuYH3Fh** to discuss changes, ask for help with matching, and coordinate before opening issues for large refactors.
+</Note>
+
+## Before you start
+
+For major changes — restructuring the build system, altering type definitions that affect the ROM layout, or changing shared headers — **open an issue first** to discuss the approach. For smaller contributions (labeling symbols, fixing comments, matching a single function), a direct pull request is fine.
+
+The general rule from the README:
+
+> Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
+
+## What the project goal means in practice
+
+The decompilation's primary goal is a **bit-identical** binary: the ROM produced by the build system must have the same SHA-1 hash as the original cartridge image for each supported version (JP, US, EU, SH, CN).
+
+This has two practical consequences:
+
+1. **Compiler**: Bit-identical output for most files requires IDO 7.1 (the original SGI compiler). GCC produces functionally correct but differently optimized code.
+2. **NON_MATCHING**: When a correct C implementation exists but its assembly output does not match IDO's output exactly, the function is wrapped in a `NON_MATCHING` guard:
+
+```c
+#ifdef NON_MATCHING
+// C equivalent — functionally correct but generates different asm
+void my_func(void) {
+    // ...
+}
+#else
+// Placeholder pulling in handwritten assembly from asm/non_matchings/
+GLOBAL_ASM("asm/non_matchings/my_func.s")
+#endif
+```
+
+Build with `NON_MATCHING=1` to compile a runnable PC port. The default build (`NON_MATCHING=0`) targets IDO and requires the full toolchain.
+
+## Code style
+
+### clang-format
+
+All C source files must be formatted with `clang-format` before submitting. The configuration is in `.clang-format` at the repository root.
+
+```bash
+# Format a single file
+clang-format -i src/game/my_file.c
+
+# Format everything (uses the provided script)
+./format.sh
+```
+
+<Warning>
+  PRs that change formatting in files unrelated to the contribution will be asked to revert those changes. Only format files you have actually modified.
+</Warning>
+
+### clang-tidy
+
+`.clang-tidy` at the repository root provides lint rules. Running clang-tidy is not mandatory but is encouraged for new code. It will flag common issues such as implicit function declarations and sign/unsigned mismatches.
+
+### Style conventions
+
+- 4-space indentation (changed from 3-space in Refresh 16, PR #1189).
+- `snake_case` for functions and variables; `UPPER_SNAKE_CASE` for macros and constants.
+- Struct field offsets are documented in comments: `/*0x00*/`, `/*0x04*/`, etc.
+- Unknown fields are named `unk` followed by their hex offset: `unkF4`, `unk1AC`.
+- Use the `UNUSED` attribute (from `include/macros.h`) for parameters that must exist for ABI compatibility but are not referenced.
+
+```c
+#ifdef __GNUC__
+#define UNUSED __attribute__((unused))
+#endif
+```
+
+## Verifying a match
+
+Two Python tools ship with the repository for comparing disassembly output.
+
+### diff.py
+
+`diff.py` is the primary matching tool. It disassembles a function from both the compiled object and the original ROM and displays a side-by-side diff.
+
+```bash
+# Compare the function "my_func" against the US ROM
+./diff.py -u my_func
+
+# Compare against the JP ROM
+./diff.py -j my_func
+
+# Compare against the EU ROM
+./diff.py -e my_func
+```
+
+### first-diff.py
+
+`first-diff.py` finds the **first** byte difference between the compiled ROM and the base ROM. It is useful for tracking down a mismatch that only appears after linking.
+
+```bash
+./first-diff.py
+```
+
+### diff_settings.py
+
+This file configures which built artifact and base ROM `diff.py` compares. Edit it to match your toolchain prefix if you use a non-standard binutils installation.
+
+```python
+def apply(config, args):
+    lang = args.lang or 'us'
+    config['mapfile']  = f'build/{lang}/sm64.{lang}.map'
+    config['myimg']    = f'build/{lang}/sm64.{lang}.z64'
+    config['baseimg']  = f'baserom.{lang}.z64'
+    config['makeflags'] = [f'VERSION={lang}']
+    config['source_directories'] = ['src', 'include', 'lib', 'lib/src', 'asm', 'rsp']
+```
+
+Change `config['source_directories']` if your cross-compiler is in a non-standard location so that `diff.py` can find source lines.
+
+## Contribution workflow
+
+<Steps>
+  <Step title="Fork and branch">
+    Fork `n64decomp/sm64` on GitHub and create a feature branch. Use a descriptive name like `match-bob-omb-behavior` or `label-camera-symbols`.
+  </Step>
+  <Step title="Implement the change">
+    Write or match your code. If writing new C for an unmatched function, build with `NON_MATCHING=1` first to verify correctness, then iterate with `diff.py` to achieve a bit-identical match.
+
+    ```bash
+    make NON_MATCHING=1 VERSION=us -j$(nproc)
+    ./diff.py -u my_func
+    ```
+  </Step>
+  <Step title="Run clang-format">
+    Format only the files you modified:
+
+    ```bash
+    clang-format -i path/to/changed_file.c
+    ```
+
+    Or use `format.sh` to format everything, then check the diff to make sure you haven't accidentally reformatted unrelated files.
+  </Step>
+  <Step title="Verify the build">
+    Build the default (matching) configuration to confirm `COMPARE=1` passes:
+
+    ```bash
+    make VERSION=us COMPARE=1 -j$(nproc)
+    ```
+
+    A successful match prints `OK` for the ROM hash check.
+  </Step>
+  <Step title="Open a pull request">
+    Push your branch and open a PR against `n64decomp/sm64`. Write a short summary of what was matched or labeled. If there is an open issue, reference it with `Closes #NNN`.
+  </Step>
+</Steps>
+
+## What makes a good contribution
+
+<CardGroup cols={2}>
+  <Card title="Label unnamed symbols" icon="tag">
+    The codebase still contains many functions and variables named `func_802XXXXX` or `D_802XXXXX`. Giving them descriptive names based on their behavior is high-value work that helps everyone reading the code.
+  </Card>
+  <Card title="Document behavior" icon="file-lines">
+    Add comments that explain *why* code does something, not just *what* it does. Comments citing specific game mechanics ("this prevents the camera from entering the water before Mario" etc.) are especially useful.
+  </Card>
+  <Card title="Fix fake matches" icon="bug">
+    A "fake match" is a function where the assembly output matches byte-for-byte but the C source uses incorrect types, logic, or undefined behavior to achieve it. Replacing fake matches with genuine decompilations is a priority.
+  </Card>
+  <Card title="Match non-matching functions" icon="code">
+    Functions guarded by `NON_MATCHING` / `GLOBAL_ASM` need real C implementations that produce identical IDO output. Use `diff.py` iteratively to converge on a match.
+  </Card>
+</CardGroup>
+
+## The CHANGES file
+
+All significant contributions are recorded in the `CHANGES` file at the repository root, organized by "Refresh" release. It provides a historical record of every PR that has been merged, including the PR number. Browsing it is a good way to understand the project's progress and find areas that still need work.
+
+```
+Refresh 16 (Two years later...)
+1.)  remove capstone from readme, slight update (#1212)
+2.)  Update ido static recomp (#1211)
+...
+14.) Object Labeling, Behavior Params, and Cleanup (#1193)
+15.) Significantly more Libultra Cleanup (#1192)
+16.) Typedefs for area Terrain Data and Rooms (#1178)
+```
+
+## Useful macros for contributors
+
+`include/macros.h` provides several attributes that are important for correctness in the decompilation context:
+
+```c
+// Mark a variable/parameter as intentionally unused:
+#define UNUSED __attribute__((unused))
+
+// Mark a function as non-returning:
+#define NORETURN __attribute__((noreturn))
+
+// Align data for DMA (8-byte boundary):
+#define ALIGNED8 __attribute__((aligned(8)))
+
+// Align data for the audio library (16-byte boundary):
+#define ALIGNED16 __attribute__((aligned(16)))
+
+// Convert a virtual address to a physical N64 address:
+#define VIRTUAL_TO_PHYSICAL(addr) ((uintptr_t)(addr) & 0x1FFFFFFF)
+
+// Convert a physical address back to virtual:
+#define PHYSICAL_TO_VIRTUAL(addr) ((uintptr_t)(addr) | 0x80000000)
+```
+
+Using `ALIGNED8` / `ALIGNED16` on DMA buffers and audio data is required to match the original binary's section layout.
+
+## Quick reference
+
+| Task | Command |
+|------|---------|
+| Build (US, compare ROM hash) | `make VERSION=us COMPARE=1 -j$(nproc)` |
+| Build without matching (PC port) | `make NON_MATCHING=1 VERSION=us -j$(nproc)` |
+| Build Japanese version | `make VERSION=jp COMPARE=1 -j$(nproc)` |
+| Compare a function | `./diff.py -u function_name` |
+| Find first ROM difference | `./first-diff.py` |
+| Format modified file | `clang-format -i path/to/file.c` |
+| Format all files | `./format.sh` |

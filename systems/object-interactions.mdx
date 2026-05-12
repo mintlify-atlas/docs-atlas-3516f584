@@ -1,0 +1,400 @@
+---
+title: "Object interactions: Mario collision and responses"
+description: "How SM64 resolves Mario–object collisions: interact-type bitmasks, handler dispatch table, ObjectHitbox geometry, and the oInteractStatus acknowledgement field."
+---
+
+When Mario's cylindrical hitbox overlaps an object's hitbox, SM64 does not immediately react—it records which **interaction types** were collided this frame in a bitmask, then dispatches a dedicated handler function for each type once per frame. This deferred dispatch model, combined with the `oInteractStatus` field that objects set as acknowledgement, allows collectibles, enemies, hazards, doors, and environmental triggers to all share the same collision detection pass while handling results completely differently.
+
+## Interaction type constants
+
+Each object declares which kind of interaction it participates in by setting `oInteractType` (rawData slot `0x2A`). The values are single-bit flags defined in `src/game/interaction.h`:
+
+```c
+// src/game/interaction.h
+#define INTERACT_HOOT           (1 <<  0)  // 0x00000001 — Hoot the owl (ride)
+#define INTERACT_GRABBABLE      (1 <<  1)  // 0x00000002 — can be picked up by Mario
+#define INTERACT_DOOR           (1 <<  2)  // 0x00000004 — door / entrance
+#define INTERACT_DAMAGE         (1 <<  3)  // 0x00000008 — generic damage source
+#define INTERACT_COIN           (1 <<  4)  // 0x00000010 — yellow/blue/red coin
+#define INTERACT_CAP            (1 <<  5)  // 0x00000020 — cap powerup
+#define INTERACT_POLE           (1 <<  6)  // 0x00000040 — climbable pole
+#define INTERACT_KOOPA          (1 <<  7)  // 0x00000080 — Koopa (bounce-top)
+#define INTERACT_BREAKABLE      (1 <<  9)  // 0x00000200 — breakable object
+#define INTERACT_STRONG_WIND    (1 << 10)  // 0x00000400 — strong wind push
+#define INTERACT_WARP_DOOR      (1 << 11)  // 0x00000800 — door that warps
+#define INTERACT_STAR_OR_KEY    (1 << 12)  // 0x00001000 — Power Star or key
+#define INTERACT_WARP           (1 << 13)  // 0x00002000 — warp point
+#define INTERACT_CANNON_BASE    (1 << 14)  // 0x00004000 — cannon entrance
+#define INTERACT_BOUNCE_TOP     (1 << 15)  // 0x00008000 — bounce when stomped (Goomba)
+#define INTERACT_WATER_RING     (1 << 16)  // 0x00010000 — Manta Ray water ring
+#define INTERACT_BULLY          (1 << 17)  // 0x00020000 — Bully shove
+#define INTERACT_FLAME          (1 << 18)  // 0x00040000 — fire source
+#define INTERACT_KOOPA_SHELL    (1 << 19)  // 0x00080000 — rideable shell
+#define INTERACT_BOUNCE_TOP2    (1 << 20)  // 0x00100000 — secondary bounce-top
+#define INTERACT_MR_BLIZZARD    (1 << 21)  // 0x00200000 — Mr. Blizzard snowball
+#define INTERACT_HIT_FROM_BELOW (1 << 22)  // 0x00400000 — hit when punched from below
+#define INTERACT_TEXT           (1 << 23)  // 0x00800000 — sign / NPC dialog
+#define INTERACT_TORNADO        (1 << 24)  // 0x01000000 — Tweester
+#define INTERACT_WHIRLPOOL      (1 << 25)  // 0x02000000 — underwater whirlpool
+#define INTERACT_CLAM_OR_BUBBA  (1 << 26)  // 0x04000000 — clam / Bubba grab
+#define INTERACT_BBH_ENTRANCE   (1 << 27)  // 0x08000000 — BBH mansion entrance
+#define INTERACT_SNUFIT_BULLET  (1 << 28)  // 0x10000000 — Snufit bullet
+#define INTERACT_SHOCK          (1 << 29)  // 0x20000000 — amp electric shock
+#define INTERACT_IGLOO_BARRIER  (1 << 30)  // 0x40000000 — SL igloo doorway
+```
+
+### Interaction subtypes
+
+Several `INTERACT_*` flags share a second bitmask field `oInteractionSubtype` that further qualifies behavior:
+
+```c
+// src/game/interaction.h
+// INTERACT_WARP
+#define INT_SUBTYPE_FADING_WARP       0x00000001
+
+// Generic damage modifiers
+#define INT_SUBTYPE_DELAY_INVINCIBILITY 0x00000002
+#define INT_SUBTYPE_BIG_KNOCKBACK       0x00000008 // Bowser: 40 units forward velocity on hit
+
+// INTERACT_GRABBABLE
+#define INT_SUBTYPE_GRABS_MARIO       0x00000004 // object grabs Mario (e.g. Chuckya)
+#define INT_SUBTYPE_HOLDABLE_NPC      0x00000010 // gentle-drop when thrown with no vel
+#define INT_SUBTYPE_DROP_IMMEDIATELY  0x00000040 // drop after dialog finishes
+#define INT_SUBTYPE_KICKABLE          0x00000100
+#define INT_SUBTYPE_NOT_GRABBABLE     0x00000200 // Heavy-Ho: can throw Mario but not be grabbed
+
+// INTERACT_DOOR
+#define INT_SUBTYPE_STAR_DOOR         0x00000020
+
+// INTERACT_BOUNCE_TOP
+#define INT_SUBTYPE_TWIRL_BOUNCE      0x00000080
+
+// INTERACT_STAR_OR_KEY
+#define INT_SUBTYPE_NO_EXIT           0x00000400
+#define INT_SUBTYPE_GRAND_STAR        0x00000800
+
+// INTERACT_TEXT
+#define INT_SUBTYPE_SIGN              0x00001000
+#define INT_SUBTYPE_NPC               0x00004000
+
+// INTERACT_CLAM_OR_BUBBA
+#define INT_SUBTYPE_EATS_MARIO        0x00002000
+```
+
+## collidedObjInteractTypes bitmask
+
+Both `struct Object` and `struct MarioState` carry a `collidedObjInteractTypes` field:
+
+```c
+// include/types.h
+// In struct Object:
+/*0x070*/ u32 collidedObjInteractTypes;
+
+// In struct MarioState:
+/*0xA4*/ u32 collidedObjInteractTypes;
+```
+
+Each frame, when Mario overlaps another object the object's `oInteractType` bits are ORed into **Mario's** `collidedObjInteractTypes`. The object itself also accumulates which interaction types it was contacted by into its own copy.
+
+## The handler dispatch table
+
+`mario_process_interactions()` iterates the static handler table, checking each registered type against Mario's `collidedObjInteractTypes`:
+
+```c
+// src/game/interaction.c:84
+static struct InteractionHandler sInteractionHandlers[] = {
+    { INTERACT_COIN,           interact_coin           },
+    { INTERACT_WATER_RING,     interact_water_ring     },
+    { INTERACT_STAR_OR_KEY,    interact_star_or_key    },
+    { INTERACT_BBH_ENTRANCE,   interact_bbh_entrance   },
+    { INTERACT_WARP,           interact_warp           },
+    { INTERACT_WARP_DOOR,      interact_warp_door      },
+    { INTERACT_DOOR,           interact_door           },
+    { INTERACT_CANNON_BASE,    interact_cannon_base    },
+    { INTERACT_IGLOO_BARRIER,  interact_igloo_barrier  },
+    { INTERACT_TORNADO,        interact_tornado        },
+    { INTERACT_WHIRLPOOL,      interact_whirlpool      },
+    { INTERACT_STRONG_WIND,    interact_strong_wind    },
+    { INTERACT_FLAME,          interact_flame          },
+    { INTERACT_SNUFIT_BULLET,  interact_snufit_bullet  },
+    { INTERACT_CLAM_OR_BUBBA,  interact_clam_or_bubba  },
+    { INTERACT_BULLY,          interact_bully          },
+    { INTERACT_SHOCK,          interact_shock          },
+    { INTERACT_BOUNCE_TOP2,    interact_bounce_top     }, // same handler as BOUNCE_TOP
+    { INTERACT_MR_BLIZZARD,    interact_mr_blizzard    },
+    { INTERACT_HIT_FROM_BELOW, interact_hit_from_below },
+    { INTERACT_BOUNCE_TOP,     interact_bounce_top     },
+    { INTERACT_DAMAGE,         interact_damage         },
+    { INTERACT_POLE,           interact_pole           },
+    { INTERACT_HOOT,           interact_hoot           },
+    { INTERACT_BREAKABLE,      interact_breakable      },
+    { INTERACT_KOOPA,          interact_bounce_top     },
+    { INTERACT_KOOPA_SHELL,    interact_koopa_shell    },
+    { INTERACT_UNKNOWN_08,     interact_unknown_08     },
+    { INTERACT_CAP,            interact_cap            },
+    { INTERACT_GRABBABLE,      interact_grabbable      },
+    { INTERACT_TEXT,           interact_text           },
+};
+```
+
+The dispatch loop in `mario_process_interactions()`:
+
+```c
+// src/game/interaction.c:1780
+void mario_process_interactions(struct MarioState *m) {
+    sDelayInvincTimer = FALSE;
+    sInvulnerable = (m->action & ACT_FLAG_INVULNERABLE) || m->invincTimer != 0;
+
+    if (!(m->action & ACT_FLAG_INTANGIBLE) && m->collidedObjInteractTypes != 0) {
+        s32 i;
+        for (i = 0; i < ARRAY_COUNT(sInteractionHandlers); i++) {
+            u32 interactType = sInteractionHandlers[i].interactType;
+            if (m->collidedObjInteractTypes & interactType) {
+                struct Object *object = mario_get_collided_object(m, interactType);
+
+                m->collidedObjInteractTypes &= ~interactType; // consume this type
+
+                if (!(object->oInteractStatus & INT_STATUS_INTERACTED)) {
+                    if (sInteractionHandlers[i].handler(m, interactType, object)) {
+                        break; // handler returned TRUE → stop processing
+                    }
+                }
+            }
+        }
+    }
+
+    if (m->invincTimer > 0 && !sDelayInvincTimer) {
+        m->invincTimer--;
+    }
+}
+```
+
+Key points:
+- Each type is consumed from the bitmask once handled (`&= ~interactType`), so each type is processed at most once per frame.
+- The guard `!(object->oInteractStatus & INT_STATUS_INTERACTED)` prevents double-collecting an already-taken object.
+- If a handler returns `TRUE` (e.g. a damage handler that changes Mario's action), the loop breaks immediately.
+
+## ObjectHitbox geometry
+
+The interaction zone is a **vertical cylinder** defined by four fields in `struct Object`:
+
+```c
+// include/types.h
+/*0x1F8*/ f32 hitboxRadius;      // outer cylinder radius (Mario must be within this)
+/*0x1FC*/ f32 hitboxHeight;      // outer cylinder height
+/*0x200*/ f32 hurtboxRadius;     // inner cylinder radius (for direct contact damage)
+/*0x204*/ f32 hurtboxHeight;     // inner cylinder height
+/*0x208*/ f32 hitboxDownOffset;  // shifts the cylinder downward
+```
+
+These are set by `obj_set_hitbox()` from an `ObjectHitbox` struct:
+
+```c
+// include/types.h:204
+struct ObjectHitbox {
+    /*0x00*/ u32 interactType;
+    /*0x04*/ u8  downOffset;
+    /*0x05*/ s8  damageOrCoinValue;
+    /*0x06*/ s8  health;
+    /*0x07*/ s8  numLootCoins;
+    /*0x08*/ s16 radius;
+    /*0x0A*/ s16 height;
+    /*0x0C*/ s16 hurtboxRadius;
+    /*0x0E*/ s16 hurtboxHeight;
+};
+```
+
+Separate hitbox and hurtbox sizes allow enemies to have a generous detection zone while requiring more precise contact for dealing damage. A Goomba's hitbox extends 72 units out, but its hurtbox—the region where Mario actually takes damage by walking into it—is only 42 units.
+
+```c
+// src/game/behaviors/goomba.inc.c
+static struct ObjectHitbox sGoombaHitbox = {
+    /* interactType:      */ INTERACT_BOUNCE_TOP,
+    /* downOffset:        */ 0,
+    /* damageOrCoinValue: */ 1,
+    /* health:            */ 0,
+    /* numLootCoins:      */ 1,
+    /* radius:            */ 72,
+    /* height:            */ 50,
+    /* hurtboxRadius:     */ 42,
+    /* hurtboxHeight:     */ 40,
+};
+```
+
+## oInteractStatus result field
+
+After a handler runs it communicates back to the object through `oInteractStatus` (rawData slot `0x2B`):
+
+```c
+// src/game/interaction.h
+
+// Mario-side status bits (low byte)
+#define INT_STATUS_MARIO_STUNNED        (1 <<  0)  // 0x00000001
+#define INT_STATUS_MARIO_KNOCKBACK_DMG  (1 <<  1)  // 0x00000002
+#define INT_STATUS_MARIO_DROP_OBJECT    (1 <<  3)  // 0x00000008
+#define INT_STATUS_MARIO_SHOCKWAVE      (1 <<  4)  // 0x00000010
+
+// Object-side status bits (upper bits)
+#define INT_STATUS_GRABBED_MARIO        (1 << 11)  // 0x00000800
+#define INT_STATUS_ATTACKED_MARIO       (1 << 13)  // 0x00002000
+#define INT_STATUS_WAS_ATTACKED         (1 << 14)  // 0x00004000
+#define INT_STATUS_INTERACTED           (1 << 15)  // 0x00008000 — already handled
+#define INT_STATUS_TRAP_TURN            (1 << 20)  // 0x00100000
+#define INT_STATUS_HIT_MINE             (1 << 21)  // 0x00200000
+#define INT_STATUS_STOP_RIDING          (1 << 22)  // 0x00400000
+#define INT_STATUS_TOUCHED_BOB_OMB      (1 << 23)  // 0x00800000
+```
+
+The object's behavior function reads `oInteractStatus` every frame to detect that an interaction occurred. For example, the coin checks `INT_STATUS_INTERACTED` to know when to spawn sparkles and delete itself:
+
+```c
+// src/game/behaviors/coin.inc.c
+s32 bhv_coin_sparkles_init(void) {
+    if (o->oInteractStatus & INT_STATUS_INTERACTED
+        && !(o->oInteractStatus & INT_STATUS_TOUCHED_BOB_OMB)) {
+        spawn_object(o, MODEL_SPARKLES, bhvGoldenCoinSparkles);
+        obj_mark_for_deletion(o);
+        return TRUE;
+    }
+
+    o->oInteractStatus = 0; // clear if no interaction
+    return FALSE;
+}
+```
+
+## Mario's attack types
+
+When Mario is in an attacking state, `determine_interaction()` sets one of these attack constants in the interaction result:
+
+```c
+// src/game/interaction.h
+#define ATTACK_PUNCH                 1
+#define ATTACK_KICK_OR_TRIP          2
+#define ATTACK_FROM_ABOVE            3  // jump on top
+#define ATTACK_GROUND_POUND_OR_TWIRL 4
+#define ATTACK_FAST_ATTACK           5
+#define ATTACK_FROM_BELOW            6
+```
+
+Enemy behaviors index into their own attack handler tables (typically `u8[][6]`) keyed by these values to determine the response—knockback, squish, or no effect.
+
+## Complete walkthrough: coin collection
+
+<Steps>
+  <Step title="Setup — ObjectHitbox">
+    During `bhv_yellow_coin_init`, the coin calls `obj_set_hitbox(o, &sYellowCoinHitbox)`. This writes `INTERACT_COIN` into `oInteractType`, `100` into `hitboxRadius`, and `64` into `hitboxHeight`. The coin is now detectable.
+  </Step>
+
+  <Step title="Collision detection">
+    Each frame the collision system tests Mario's capsule against every active object. When Mario steps inside the coin's cylinder, the coin's `oInteractType` (`INTERACT_COIN`) is ORed into both `mario->collidedObjInteractTypes` and the coin's own `collidedObjInteractTypes`. The coin is also stored in Mario's `collidedObjs[]` array.
+  </Step>
+
+  <Step title="Handler dispatch">
+    `mario_process_interactions()` finds `INTERACT_COIN` set in `m->collidedObjInteractTypes`. It calls `mario_get_collided_object(m, INTERACT_COIN)` to retrieve the coin pointer, then invokes `interact_coin(m, INTERACT_COIN, coinObj)`.
+  </Step>
+
+  <Step title="interact_coin runs">
+    ```c
+    // src/game/interaction.c:743
+    u32 interact_coin(struct MarioState *m, UNUSED u32 interactType, struct Object *o) {
+        m->numCoins += o->oDamageOrCoinValue;  // add 1 coin to Mario's total
+        m->healCounter += 4 * o->oDamageOrCoinValue; // schedule health recovery
+
+        o->oInteractStatus = INT_STATUS_INTERACTED; // signal the coin object
+
+        if (COURSE_IS_MAIN_COURSE(gCurrCourseNum)
+            && m->numCoins - o->oDamageOrCoinValue < 100 && m->numCoins >= 100) {
+            bhv_spawn_star_no_level_exit(STAR_INDEX_100_COINS); // 100-coin star!
+        }
+
+        return FALSE; // don't stop processing other interaction types
+    }
+    ```
+  </Step>
+
+  <Step title="Object responds to oInteractStatus">
+    On the next frame, the coin's `bhv_yellow_coin_loop` calls `bhv_coin_sparkles_init()`. It sees `INT_STATUS_INTERACTED` set, spawns the golden sparkle effect, and calls `obj_mark_for_deletion(o)` to remove the coin.
+  </Step>
+</Steps>
+
+## Complete walkthrough: star collection
+
+Stars use `INTERACT_STAR_OR_KEY`. The handler is more complex because collecting a star typically ends the level:
+
+```c
+// src/game/interaction.c:769
+u32 interact_star_or_key(struct MarioState *m, UNUSED u32 interactType, struct Object *o) {
+    u32 noExit    = (o->oInteractionSubtype & INT_SUBTYPE_NO_EXIT)    != 0;
+    u32 grandStar = (o->oInteractionSubtype & INT_SUBTYPE_GRAND_STAR) != 0;
+
+    if (m->health >= 0x100) {
+        mario_stop_riding_and_holding(m);
+
+        if (!noExit) {
+            m->hurtCounter = 0;
+            // ... save star to file, set action to ACT_STAR_DANCE_EXIT, etc.
+        } else {
+            // No-exit star (e.g. 100-coin star): only dance, don't leave level
+        }
+
+        o->oInteractStatus = INT_STATUS_INTERACTED;
+    }
+
+    return FALSE;
+}
+```
+
+The star's behavior script then detects `INT_STATUS_INTERACTED` and plays its collect animation before the level transitions.
+
+## Interaction type quick reference
+
+<CardGroup cols={2}>
+  <Card title="Collectibles" icon="coins">
+    `INTERACT_COIN` — coins, blue coins, red coins
+
+    `INTERACT_STAR_OR_KEY` — Power Stars and castle keys
+
+    `INTERACT_CAP` — Wing Cap, Metal Cap, Vanish Cap
+
+    `INTERACT_WATER_RING` — Manta Ray rings (heal)
+  </Card>
+  <Card title="Hazards" icon="triangle-exclamation">
+    `INTERACT_DAMAGE` — generic enemy contact damage
+
+    `INTERACT_BOUNCE_TOP` — enemies killed by jumping on top
+
+    `INTERACT_FLAME` — fire sources (burn damage)
+
+    `INTERACT_SHOCK` — Amp electric zap
+
+    `INTERACT_BULLY` — shove physics interaction
+  </Card>
+  <Card title="Environment" icon="map">
+    `INTERACT_DOOR` — regular doors
+
+    `INTERACT_WARP_DOOR` — doors that warp to another area
+
+    `INTERACT_WARP` — invisible warp triggers
+
+    `INTERACT_CANNON_BASE` — cannon entrance
+
+    `INTERACT_TORNADO` — Tweester spiral
+
+    `INTERACT_WHIRLPOOL` — underwater whirlpool
+  </Card>
+  <Card title="Actions" icon="hand">
+    `INTERACT_GRABBABLE` — objects Mario can pick up and throw
+
+    `INTERACT_POLE` — climbable poles and trees
+
+    `INTERACT_HOOT` — Hoot the owl (grab to fly)
+
+    `INTERACT_TEXT` — signs and NPCs (dialog trigger)
+
+    `INTERACT_KOOPA_SHELL` — rideable shell
+  </Card>
+</CardGroup>
+
+<Warning>
+  An object must have `ACTIVE_FLAG_ACTIVE` set and must **not** have `ACT_FLAG_INTANGIBLE` active on Mario for interactions to be processed. Newly spawned coins call `cur_obj_become_intangible()` during their launch arc so they cannot be collected before landing.
+</Warning>

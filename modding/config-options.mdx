@@ -1,0 +1,283 @@
+---
+title: "Config options: build flags and runtime settings"
+description: "Complete reference for all defines in include/config.h and Makefile build variables: bug fixes, hardware features, screen dimensions, and compiler options."
+---
+
+The SM64 decompilation exposes two layers of configuration. Runtime behaviour — bug fixes, hardware feature flags, screen dimensions, and stack sizes — is controlled by preprocessor defines in `include/config.h`. The toolchain and ROM target are controlled by Makefile variables that you pass on the `make` command line. This page documents both layers in full.
+
+## include/config.h
+
+`config.h` is described in its own header comment as "a catch-all file for configuring various bugfixes and other settings in SM64." Every define here is evaluated at compile time via the C preprocessor.
+
+### Bug fixes
+
+Nintendo introduced a number of bug fixes in regional versions released after the original Japanese launch. Each fix is individually togglable via a `BUGFIX_*` define. The default value for each define is a logical OR expression: it evaluates to `1` (enabled) whenever the active `VERSION_*` token matches one of the listed versions, and `0` otherwise.
+
+<Note>
+  All of the bug fixes listed below were introduced in the US version and carried forward into EU, Shindou (SH), and iQue (CN). None of them are active for the JP version by default. If you are building a JP ROM and want the fixes anyway, you can override the defines in your own header or directly in `config.h`.
+</Note>
+
+<AccordionGroup>
+  <Accordion title="BUGFIX_MAX_LIVES — coin overflow sets wrong life count">
+    ```c
+    #define BUGFIX_MAX_LIVES (0 || VERSION_US || VERSION_EU || VERSION_SH || VERSION_CN)
+    ```
+
+    Fixes a bug where obtaining over 999 coins sets the number of lives to 999 (or wraps to -25 depending on interpretation). Active for all non-JP versions.
+  </Accordion>
+  <Accordion title="BUGFIX_KING_BOB_OMB_FADE_MUSIC — boss music does not fade after King Bob-omb">
+    ```c
+    #define BUGFIX_KING_BOB_OMB_FADE_MUSIC (0 || VERSION_US || VERSION_EU || VERSION_SH || VERSION_CN)
+    ```
+
+    Fixes a bug where the boss music does not fade out after defeating King Bob-omb. Active for all non-JP versions.
+  </Accordion>
+  <Accordion title="BUGFIX_KOOPA_RACE_MUSIC — warp stops Koopa race music in Bob-omb Battlefield">
+    ```c
+    #define BUGFIX_KOOPA_RACE_MUSIC (0 || VERSION_US || VERSION_EU || VERSION_SH || VERSION_CN)
+    ```
+
+    Fixes a bug in Bob-omb Battlefield where entering a warp stops the Koopa race music prematurely. Active for all non-JP versions.
+  </Accordion>
+  <Accordion title="BUGFIX_PIRANHA_PLANT_STATE_RESET — Piranha Plants do not reset when player leaves">
+    ```c
+    #define BUGFIX_PIRANHA_PLANT_STATE_RESET (0 || VERSION_US || VERSION_EU || VERSION_SH || VERSION_CN)
+    ```
+
+    Fixes a bug where Piranha Plants do not reset their action state when the player exits their activation radius, causing them to stay in the wrong animation or attack state. Active for all non-JP versions.
+  </Accordion>
+  <Accordion title="BUGFIX_PIRANHA_PLANT_SLEEP_DAMAGE — sleeping Piranha Plants damage Mario">
+    ```c
+    #define BUGFIX_PIRANHA_PLANT_SLEEP_DAMAGE (0 || VERSION_US || VERSION_SH || VERSION_CN)
+    ```
+
+    Fixes a bug where sleeping (idle) Piranha Plants can damage Mario if he bumps into them, despite appearing dormant. Active for US, SH, and CN versions. **Not active for EU.**
+  </Accordion>
+  <Accordion title="BUGFIX_STAR_BOWSER_KEY — star shown when picking up a Bowser key">
+    ```c
+    #define BUGFIX_STAR_BOWSER_KEY (0 || VERSION_US || VERSION_EU || VERSION_SH || VERSION_CN)
+    ```
+
+    Fixes a bug that causes the game to display a star-collect animation when Mario grabs a key in Bowser battle stages instead of the correct key-collect animation. Active for all non-JP versions.
+  </Accordion>
+  <Accordion title="BUGFIX_DIALOG_TIME_STOP — Mario enters time stop before ready to speak">
+    ```c
+    #define BUGFIX_DIALOG_TIME_STOP (0 || VERSION_US || VERSION_EU || VERSION_SH || VERSION_CN)
+    ```
+
+    Fixes a bug that enables Mario's time-stop state during dialog even when he is not yet ready to speak, which could cause animation glitches. Active for all non-JP versions.
+  </Accordion>
+  <Accordion title="BUGFIX_BOWSER_COLLIDE_BITS_DEAD — Bowser collision persists in BitS after defeat">
+    ```c
+    #define BUGFIX_BOWSER_COLLIDE_BITS_DEAD (0 || VERSION_US || VERSION_EU || VERSION_SH || VERSION_CN)
+    ```
+
+    Fixes a bug that causes Mario to still collide with Bowser in Bowser in the Sky (BitS) after Bowser has been defeated and his object removed. Active for all non-JP versions.
+  </Accordion>
+  <Accordion title="BUGFIX_BOWSER_FALLEN_OFF_STAGE — Bowser retains speed after falling off the stage">
+    ```c
+    #define BUGFIX_BOWSER_FALLEN_OFF_STAGE (0 || VERSION_US || VERSION_EU || VERSION_SH || VERSION_CN)
+    ```
+
+    Fixes a bug where Bowser would not reset his speed when falling off the stage, and adds missing boundary checks. Active for all non-JP versions.
+  </Accordion>
+  <Accordion title="BUGFIX_BOWSER_FADING_OUT — Bowser looks incorrect while fading out">
+    ```c
+    #define BUGFIX_BOWSER_FADING_OUT (0 || VERSION_US || VERSION_EU || VERSION_SH || VERSION_CN)
+    ```
+
+    Fixes a visual bug where Bowser's render state becomes incorrect during the fade-out animation that plays after his defeat. Active for all non-JP versions.
+  </Accordion>
+</AccordionGroup>
+
+### Hardware feature flags
+
+#### ENABLE_RUMBLE
+
+```c
+#define ENABLE_RUMBLE (0 || VERSION_SH || VERSION_CN)
+```
+
+Enables Rumble Pak support. The Shindou (SH) and iQue (CN) versions of the game were the only official releases to include rumble support. This define gates all rumble-related code paths. Set it to `1` explicitly if you want to add rumble support to a JP, US, or EU build.
+
+### Screen dimensions
+
+```c
+#define SCREEN_WIDTH  320
+#define SCREEN_HEIGHT 240
+```
+
+These constants define the N64 framebuffer resolution in pixels. They are used throughout the rendering code wherever pixel coordinates are calculated — scissor rectangles, viewport setup, text positioning, and so on. Do not change these values unless you are targeting a non-standard video mode, as they are deeply embedded in the renderer.
+
+### Stack sizes
+
+```c
+#define IDLE_STACKSIZE   0x800    // 2 KB  — idle thread stack
+#define STACKSIZE        0x2000   // 8 KB  — main game thread stack
+#define UNUSED_STACKSIZE 0x1400   // 5 KB  — unused thread stack
+```
+
+These control the stack sizes allocated for the N64 OS threads. `STACKSIZE` (8 KB) is the stack for `thread5_game_loop`, the main game thread. `IDLE_STACKSIZE` (2 KB) is for the idle thread. `UNUSED_STACKSIZE` (5 KB) is allocated but not actively used by any thread in the shipped code.
+
+<Warning>
+  Increasing `STACKSIZE` reduces the amount of memory available for other allocations. Decreasing it risks stack overflow crashes in deeply nested call paths. Only change these values if you have a specific, measured need.
+</Warning>
+
+### Border height
+
+```c
+#ifdef TARGET_N64
+  #ifndef VERSION_EU
+    #define BORDER_HEIGHT 8   // NTSC top/bottom border (non-EU N64)
+  #else
+    #define BORDER_HEIGHT 1   // PAL border (EU N64)
+  #endif
+#else
+  #define BORDER_HEIGHT 0     // No border (PC ports and non-N64 targets)
+#endif
+```
+
+`BORDER_HEIGHT` controls the number of blank scanlines added at the top and bottom of the screen. On NTSC hardware (JP, US, SH, CN) this is 8 pixels; on PAL hardware (EU) it is 1 pixel. When building for a non-N64 target (`TARGET_N64 = 0`), the border is removed entirely since there is no hardware blanking requirement.
+
+---
+
+## Makefile build variables
+
+These variables are passed on the `make` command line. For example:
+
+```bash
+make VERSION=eu GRUCODE=f3dex2 NON_MATCHING=1
+```
+
+Run `make clean` before changing any build variable that affects code generation to avoid stale objects.
+
+### VERSION
+
+```
+VERSION ?= us
+```
+
+Selects which regional release of the game to build. The VERSION token controls which `VERSION_*` preprocessor define is set, which in turn gates version-specific code in `config.h` and elsewhere.
+
+| Value | Region | Year | Notes |
+|---|---|---|---|
+| `jp` | Japan | 1996 | Original release. Most `BUGFIX_*` defines are inactive. |
+| `us` | North America | 1996 | Default. All major bug fixes active. |
+| `eu` | PAL / Europe | 1997 | Adds multilingual text support (English, German, French). |
+| `sh` | Japan (Shindou) | 1997 | Includes Rumble Pak support. |
+| `cn` | China (iQue) | 2003 | iQue Player port. Includes Rumble Pak support. Uses a different linker and compiler for some files. |
+
+The build target is named `sm64.<VERSION>.z64`, placed in `build/<VERSION>/`.
+
+### GRUCODE
+
+```
+GRUCODE ?= f3d_old   # jp, us default
+GRUCODE ?= f3d_new   # eu, sh, cn default
+```
+
+Selects which RSP microcode (graphics binary) to embed in the ROM. The microcode determines which GBI (Graphics Binary Interface) macros are available at runtime.
+
+| Value | Name | Default for | Notes |
+|---|---|---|---|
+| `f3d_old` | Fast3D (original) | `jp`, `us` | Sets `F3D_OLD=1`. |
+| `f3d_new` | Fast3D 2.0H | `eu`, `sh`, `cn` | Sets `F3D_NEW=1`. |
+| `f3dex` | Fast3DEX | — | Sets `F3DEX_GBI=1` and `F3DEX_GBI_SHARED=1`. |
+| `f3dex2` | Fast3DEX2 | — | Sets `F3DEX_GBI_2=1` and `F3DEX_GBI_SHARED=1`. |
+| `f3dzex` | Fast3DZEX | — | Experimental. Used in Animal Crossing (Dōbutsu no Mori). Sets `F3DZEX_GBI_2=1`. |
+
+<Warning>
+  `f3dzex` is explicitly experimental. The Makefile prints a warning when it is selected: "Fast3DZEX is experimental. Try at your own risk."
+</Warning>
+
+Choosing a non-default GRUCODE for a given VERSION disables `COMPARE` automatically, since the resulting ROM will not match the original SHA-1 hash.
+
+### COMPILER
+
+```
+COMPILER ?= ido
+```
+
+Selects the C compiler used to build the game code.
+
+| Value | Compiler | Effect |
+|---|---|---|
+| `ido` | SGI IRIS Development Option (IDO 5.3) | Default. Required to produce a matching ROM. Uses `-mips2`. |
+| `gcc` | GNU C Compiler (cross-compiled for MIPS) | Forces `NON_MATCHING=1`, uses `-mips3` and `-O2`. |
+
+When `COMPILER=ido`, the build can use either `qemu-irix` (`USE_QEMU_IRIX=1`) or a statically recompiled IDO binary (`USE_QEMU_IRIX=0`, the default). The MIPS cross-compiler prefix is detected automatically from whichever of `mips-linux-gnu-`, `mips64-linux-gnu-`, or `mips64-elf-` is found on `PATH`.
+
+### NON_MATCHING
+
+```
+NON_MATCHING ?= 0
+```
+
+Controls whether the build attempts to produce a byte-for-byte identical copy of the original ROM.
+
+| Value | Behaviour |
+|---|---|
+| `0` | Matching build. Requires `COMPILER=ido`. Enables `COMPARE=1` by default. |
+| `1` | Non-matching build. Enables `AVOID_UB=1` and forces `COMPARE=0`. Automatically set when `COMPILER=gcc` or `TARGET_N64=0`. |
+
+When `NON_MATCHING=1`, the preprocessor defines `NON_MATCHING=1` and `AVOID_UB=1` are passed to the compiler.
+
+### AVOID_UB and the BAD_RETURN macro
+
+When `NON_MATCHING=1`, the `AVOID_UB=1` preprocessor define is enabled. This activates portable replacements for code that relies on undefined behaviour present in IDO's code generation. The primary example is the `BAD_RETURN` macro used in certain functions where the original IDO compiler happened to produce correct output from technically undefined C.
+
+The `BAD_RETURN` macro is defined in the codebase to emit a return value in a way that avoids UB under GCC while still matching the IDO output when `AVOID_UB` is not set.
+
+### COMPARE
+
+```
+COMPARE ?= 1
+```
+
+When `1`, the build system verifies the SHA-1 hash of the generated ROM against the known-good hash for the selected version after linking. A mismatch prints a warning but does not abort the build.
+
+`COMPARE` is automatically set to `0` when:
+- `NON_MATCHING=1` is active
+- A non-default `GRUCODE` is selected for the current `VERSION`
+- `TARGET_N64=0`
+
+To suppress the comparison message while still building a matching ROM, pass `COMPARE=0` explicitly.
+
+### TARGET_N64
+
+```
+TARGET_N64 ?= 1
+```
+
+When `1` (the default), the build targets real N64 hardware. This enables `-DTARGET_N64`, `-D_LANGUAGE_C`, and `-DTARGET_N64` in the compiler flags, and adds `include/libc` to the include path.
+
+Setting `TARGET_N64=0` is the entry point for PC ports and other non-N64 targets. It automatically forces `NON_MATCHING=1` and sets `BORDER_HEIGHT` to `0`.
+
+### CROSS
+
+The MIPS toolchain prefix is auto-detected in this order:
+
+1. `mips-linux-gnu-`
+2. `mips64-linux-gnu-`
+3. `mips64-elf-`
+
+If none are found, the Makefile aborts with an error. You can override the prefix explicitly:
+
+```bash
+make CROSS=mips64-elf-
+```
+
+### Summary table
+
+| Variable | Default | Valid values | Description |
+|---|---|---|---|
+| `VERSION` | `us` | `jp us eu sh cn` | Game region to build |
+| `GRUCODE` | version-dependent | `f3d_old f3dex f3dex2 f3d_new f3dzex` | RSP microcode |
+| `COMPILER` | `ido` | `ido gcc` | C compiler |
+| `NON_MATCHING` | `0` | `0 1` | Allow non-matching output |
+| `COMPARE` | `1` | `0 1` | Verify ROM SHA-1 after build |
+| `TARGET_N64` | `1` | `0 1` | Build for N64 hardware |
+| `CROSS` | auto-detected | any MIPS toolchain prefix | MIPS toolchain prefix |
+| `USE_QEMU_IRIX` | `0` | `0 1` | Use qemu-irix for IDO compiler |
+| `VERBOSE` | `0` | `0 1` | Print full build commands |
+| `COLOR` | `1` | `0 1` | Colorize build output |

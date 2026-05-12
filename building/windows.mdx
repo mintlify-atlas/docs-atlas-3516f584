@@ -1,0 +1,140 @@
+---
+title: 'Building SM64 on Windows'
+description: 'Compile the SM64 decompilation on Windows using WSL2 (recommended) or MSYS2, with setup steps, WSL1 compatibility notes, and drive-mount guidance.'
+---
+
+Windows is supported through two approaches: the Windows Subsystem for Linux (WSL) and MSYS2. WSL2 is the recommended path because it provides a full Linux kernel and the widest compatibility with the build toolchain.
+
+<Note>
+  Once your Linux environment is set up, the actual build steps are identical to the [Linux build guide](/building/linux). This page covers only the Windows-specific setup.
+</Note>
+
+## Option 1: WSL (recommended)
+
+WSL lets you run a Linux distribution directly on Windows without a virtual machine. WSL2 is strongly preferred over WSL1.
+
+<Warning>
+  WSL1 does not support Ubuntu 20.04 or later. If you want to use Ubuntu, install WSL2 or use Ubuntu 18.04 under WSL1. Debian is a reliable alternative that works under both versions.
+</Warning>
+
+<Steps>
+  <Step title="Enable WSL and install a distribution">
+    Follow the official Microsoft guide to install WSL2 and a Linux distribution of your choice:
+
+    [Windows Subsystem for Linux Installation Guide for Windows 10](https://docs.microsoft.com/en-us/windows/wsl/install-win10)
+
+    The recommended distributions are **Debian** or **Ubuntu 18.04**. Both are available in the Microsoft Store after WSL is enabled.
+
+    For Windows 11 and recent Windows 10 builds, you can install WSL2 with a single command in an elevated PowerShell:
+
+    ```powershell
+    wsl --install
+    ```
+
+    Then install your preferred distribution:
+
+    ```powershell
+    wsl --install -d Debian
+    ```
+  </Step>
+
+  <Step title="Confirm you are running WSL2">
+    In PowerShell, verify the WSL version assigned to your distribution:
+
+    ```powershell
+    wsl --list --verbose
+    ```
+
+    The `VERSION` column should show `2`. If it shows `1`, upgrade with:
+
+    ```powershell
+    wsl --set-version <DistroName> 2
+    ```
+  </Step>
+
+  <Step title="Open your Linux shell">
+    Launch your installed distribution from the Start menu or by running `wsl` in PowerShell. All subsequent steps run inside this Linux shell.
+  </Step>
+
+  <Step title="Follow the Linux build instructions">
+    Inside your WSL shell, follow the [Linux build guide](/building/linux) for your chosen distribution to install dependencies, clone the repository, place the baserom, and run `make`.
+
+    ```bash
+    # Example for Debian / Ubuntu inside WSL
+    sudo apt install -y binutils-mips-linux-gnu build-essential git pkgconf python3
+    git clone https://github.com/n64decomp/sm64.git
+    cd sm64
+    cp /mnt/c/Users/<YourName>/Downloads/sm64.z64 baserom.us.z64
+    make VERSION=us -j4
+    ```
+
+    <Note>
+      Your Windows drives are mounted under `/mnt/` inside WSL (e.g., `C:\` is `/mnt/c/`). Use these paths to copy the baserom from your Windows filesystem into the WSL environment.
+    </Note>
+  </Step>
+</Steps>
+
+## Option 2: MSYS2
+
+MSYS2 provides a Unix-like shell and package manager (pacman) on native Windows. It is a supported alternative if you prefer not to use WSL.
+
+<Steps>
+  <Step title="Install MSYS2">
+    Download and run the MSYS2 installer from [msys2.org](https://www.msys2.org/). Follow the on-screen instructions to complete the installation.
+  </Step>
+
+  <Step title="Update the package database">
+    Open the **MSYS2 MinGW 64-bit** shell and update all packages:
+
+    ```bash
+    pacman -Syu
+    ```
+
+    Close and reopen the shell if prompted, then run:
+
+    ```bash
+    pacman -Su
+    ```
+  </Step>
+
+  <Step title="Install build dependencies">
+    Install the required tools through pacman. You will need a MIPS cross-compiler toolchain appropriate for your MSYS2 environment, along with Python and the base development tools:
+
+    ```bash
+    pacman -S base-devel python3
+    ```
+
+    Install the MIPS binutils cross-compiler package matching your MSYS2 environment. Refer to the MSYS2 package repository for the current package name.
+  </Step>
+
+  <Step title="Clone the repository and build">
+    From the MSYS2 shell, clone the repository and run `make` as you would on Linux:
+
+    ```bash
+    git clone https://github.com/n64decomp/sm64.git
+    cd sm64
+    cp /c/Users/<YourName>/Downloads/sm64.z64 baserom.us.z64
+    make VERSION=us -j4
+    ```
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="WSL1 build fails or stalls">
+    WSL1 has known incompatibilities with the build toolchain, especially on newer Ubuntu releases. Upgrade to WSL2 (see step 2 above) or switch to Debian, which tends to be more stable under WSL1.
+  </Accordion>
+
+  <Accordion title="Cannot find the baserom from inside WSL">
+    Windows drives are accessible inside WSL at `/mnt/<drive-letter>/`. For example, a file at `C:\Users\Name\Downloads\sm64.z64` can be copied with:
+
+    ```bash
+    cp /mnt/c/Users/Name/Downloads/sm64.z64 baserom.us.z64
+    ```
+  </Accordion>
+
+  <Accordion title="Build errors about path length">
+    Ensure the full path to your cloned repository (as seen inside the Linux shell) does not exceed 255 characters. Clone closer to the filesystem root if needed.
+  </Accordion>
+</AccordionGroup>

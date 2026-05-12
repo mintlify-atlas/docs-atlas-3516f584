@@ -1,0 +1,215 @@
+---
+title: 'Building SM64 on Linux'
+description: 'Step-by-step instructions for compiling the SM64 decompilation on Debian, Ubuntu, Arch Linux, Fedora, and other Linux distributions.'
+---
+
+Linux is the primary supported platform for building the SM64 decompilation. The build system requires a MIPS cross-compiler toolchain, Python 3.6 or later, and standard build tools. Most major distributions package everything you need.
+
+## Prerequisites
+
+The build system requires:
+
+- A MIPS binutils cross-compiler toolchain
+- `pkgconf` (or `pkg-config`)
+- Python 3.6 or later
+- Standard C build tools (`gcc`, `make`, etc.)
+
+<Warning>
+  Ensure the full path to your cloned repository does not exceed 255 characters. Paths longer than this limit will cause build errors.
+</Warning>
+
+## Install dependencies
+
+<Tabs>
+  <Tab title="Debian / Ubuntu">
+    <Steps>
+      <Step title="Install build dependencies">
+        Run the following command to install all required packages in one step:
+
+        ```bash
+        sudo apt install -y binutils-mips-linux-gnu build-essential git pkgconf python3
+        ```
+
+        This installs the `mips-linux-gnu-` prefixed toolchain, which the Makefile detects automatically.
+      </Step>
+
+      <Step title="Clone the repository">
+        Clone the SM64 repo from within your Linux environment:
+
+        ```bash
+        git clone https://github.com/n64decomp/sm64.git
+        cd sm64
+        ```
+      </Step>
+
+      <Step title="Place the baserom">
+        Copy your original SM64 ROM into the project directory. The filename must match the version you intend to build:
+
+        ```bash
+        # Replace <VERSION> with jp, us, eu, sh, or cn
+        cp /path/to/your/rom.z64 baserom.<VERSION>.z64
+        ```
+
+        For example, to build the North American version:
+
+        ```bash
+        cp /path/to/sm64.z64 baserom.us.z64
+        ```
+      </Step>
+
+      <Step title="Build the ROM">
+        Run `make` to build. The default version is `us`. Use `-j` to parallelize the build across CPU cores:
+
+        <CodeGroup>
+
+        ```bash Default (US version)
+        make
+        ```
+
+        ```bash Japanese version, 4 jobs
+        make VERSION=jp -j4
+        ```
+
+        ```bash EU version, skip hash check
+        make VERSION=eu COMPARE=0
+        ```
+
+        </CodeGroup>
+
+        Build artifacts are written to the `build/` directory. The final ROM is `build/<VERSION>/sm64.<VERSION>.z64`.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Arch Linux">
+    <Steps>
+      <Step title="Install base build tools">
+        Install the base development group and Python from the official repositories:
+
+        ```bash
+        sudo pacman -S base-devel python
+        ```
+      </Step>
+
+      <Step title="Install MIPS binutils from the AUR">
+        Install the [mips64-elf-binutils](https://aur.archlinux.org/packages/mips64-elf-binutils) package from the AUR. Using an AUR helper such as `yay`:
+
+        ```bash
+        yay -S mips64-elf-binutils
+        ```
+
+        Or build it manually:
+
+        ```bash
+        git clone https://aur.archlinux.org/mips64-elf-binutils.git
+        cd mips64-elf-binutils
+        makepkg -si
+        ```
+
+        This installs the `mips64-elf-` prefixed toolchain, which the Makefile detects automatically.
+      </Step>
+
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/n64decomp/sm64.git
+        cd sm64
+        ```
+      </Step>
+
+      <Step title="Place the baserom">
+        Copy your original SM64 ROM into the project directory with the correct version suffix:
+
+        ```bash
+        cp /path/to/your/rom.z64 baserom.us.z64
+        ```
+      </Step>
+
+      <Step title="Build the ROM">
+        <CodeGroup>
+
+        ```bash Default (US version)
+        make
+        ```
+
+        ```bash Japanese version, 4 jobs
+        make VERSION=jp -j4
+        ```
+
+        </CodeGroup>
+
+        Build artifacts are written to the `build/` directory.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Fedora / RHEL / Other">
+    <Steps>
+      <Step title="Identify your MIPS toolchain">
+        Different distributions ship binutils under different cross-compiler prefixes. The Makefile probes for them in this order:
+
+        | Prefix | Typical distro |
+        |--------|---------------|
+        | `mips-linux-gnu-` | Ubuntu, Debian, and derivatives |
+        | `mips64-linux-gnu-` | Fedora, RHEL, CentOS |
+        | `mips64-elf-` | Arch Linux (AUR) |
+
+        Install whichever package provides one of these prefixes on your distribution. On Fedora/RHEL:
+
+        ```bash
+        sudo dnf install gcc make python3 pkgconf binutils-mips64-linux-gnu
+        ```
+
+        If your distribution does not ship any of these toolchain variants, use the [Docker-based build](/building/docker) instead.
+      </Step>
+
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/n64decomp/sm64.git
+        cd sm64
+        ```
+      </Step>
+
+      <Step title="Place the baserom">
+        Copy your original SM64 ROM into the project directory:
+
+        ```bash
+        cp /path/to/your/rom.z64 baserom.us.z64
+        ```
+      </Step>
+
+      <Step title="Build the ROM">
+        If the Makefile cannot auto-detect your toolchain prefix, supply it explicitly with the `CROSS` variable:
+
+        <CodeGroup>
+
+        ```bash Auto-detected toolchain
+        make VERSION=us -j4
+        ```
+
+        ```bash Explicit toolchain prefix
+        make VERSION=us CROSS=mips64-linux-gnu- -j4
+        ```
+
+        </CodeGroup>
+
+        Build artifacts are written to the `build/` directory.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Verifying the build
+
+After a successful build the ROM is written to `build/<VERSION>/sm64.<VERSION>.z64`. By default (`COMPARE=1`) the Makefile checks the SHA-1 hash of the output against the known-good hash for each version:
+
+| Version | Expected SHA-1 |
+|---------|---------------|
+| `jp` | `8a20a5c83d6ceb0f0506cfc9fa20d8f438cafe51` |
+| `us` | `9bef1128717f958171a4afac3ed78ee2bb4e86ce` |
+| `eu` | `4ac5721683d0e0b6bbb561b58a71740845dceea9` |
+| `sh` | `3f319ae697533a255a1003d09202379d78d5a2e0` |
+| `cn` | `2e1db2780985a1f068077dc0444b685f39cd90ec` |
+
+<Note>
+  A hash mismatch is expected when you make code changes and is not an error. Set `COMPARE=0` to silence the check while modifying the codebase.
+</Note>

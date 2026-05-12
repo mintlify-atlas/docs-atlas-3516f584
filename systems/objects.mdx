@@ -1,0 +1,320 @@
+---
+title: "Object system: game entities and spawning"
+description: "How SM64 represents every entity as a struct Object: the GraphNode hierarchy, rawData union, object lists, spawn functions, hitboxes, and object lifecycle."
+---
+
+Every interactive entity in Super Mario 64—coins, enemies, platforms, stars, and Mario himself—is an instance of `struct Object`. The object system wires together graphics (via `GraphNode`), collision, behavior scripting, and game logic into one unified, 0x260-byte structure that is allocated from a fixed pool of 240 slots. Understanding this struct and the systems around it is the foundation for reading or modifying any object behavior in the game.
+
+## Struct hierarchy
+
+Objects sit at the end of a four-level inheritance chain built entirely through **composition** (first-member embedding, not C++ inheritance).
+
+```
+GraphNode
+  └─ GraphNodeObject   (adds position, rotation, scale, animation)
+       └─ ObjectNode   (adds doubly-linked list pointers for object lists)
+            └─ Object  (adds game logic: rawData, behavior, hitbox, …)
+```
+
+### GraphNode
+
+The root node used by the scene graph renderer.
+
+```c
+// include/types.h:103
+struct GraphNode {
+    /*0x00*/ s16 type;      // structure type identifier
+    /*0x02*/ s16 flags;     // hi byte = drawing layer, lo byte = rendering modes
+    /*0x04*/ struct GraphNode *prev;
+    /*0x08*/ struct GraphNode *next;
+    /*0x0C*/ struct GraphNode *parent;
+    /*0x10*/ struct GraphNode *children;
+};
+```
+
+### GraphNodeObject
+
+Adds the spatial data that the renderer uses to place and orient a visible object.
+
+```c
+// include/types.h:122
+struct GraphNodeObject {
+    /*0x00*/ struct GraphNode node;
+    /*0x14*/ struct GraphNode *sharedChild; // pointer to the model's geo layout node
+    /*0x18*/ s8 areaIndex;
+    /*0x19*/ s8 activeAreaIndex;
+    /*0x1A*/ Vec3s angle;     // pitch / yaw / roll (s16 binary angle units)
+    /*0x20*/ Vec3f pos;       // world-space position (X, Y, Z)
+    /*0x2C*/ Vec3f scale;
+    /*0x38*/ struct AnimInfo animInfo;
+    /*0x4C*/ struct SpawnInfo *unk4C;
+    /*0x50*/ Mat4 *throwMatrix;         // matrix ptr used when object is being thrown
+    /*0x54*/ Vec3f cameraToObject;
+};
+```
+
+### ObjectNode
+
+Embeds `GraphNodeObject` and adds the two linked-list pointers that chain objects together within their object list.
+
+```c
+// include/types.h:136
+struct ObjectNode {
+    struct GraphNodeObject gfx;
+    struct ObjectNode *next;
+    struct ObjectNode *prev;
+};
+```
+
+### Object
+
+The full game object. `header` is an `ObjectNode`, so `&obj->header` can be cast to `struct ObjectNode *` or `struct GraphNodeObject *` wherever the graphics subsystem expects it.
+
+```c
+// include/types.h:145
+struct Object {
+    /*0x000*/ struct ObjectNode header;          // gfx node + list links
+    /*0x068*/ struct Object *parentObj;          // spawning parent (points to self if none)
+    /*0x06C*/ struct Object *prevObj;            // previous object spawned by parent
+    /*0x070*/ u32 collidedObjInteractTypes;      // bitmask of interact types collided this frame
+    /*0x074*/ s16 activeFlags;                   // ACTIVE_FLAG_* bitmask
+    /*0x076*/ s16 numCollidedObjs;
+    /*0x078*/ struct Object *collidedObjs[4];    // up to 4 objects overlapping this frame
+    /*0x088*/ union { ... } rawData;             // 0x50-slot typed union (see below)
+    /*0x1CC*/ const BehaviorScript *curBhvCommand; // current position in behavior script
+    /*0x1D0*/ u32 bhvStackIndex;
+    /*0x1D4*/ uintptr_t bhvStack[8];            // subroutine call stack for CALL/RETURN
+    /*0x1F4*/ s16 bhvDelayTimer;                // countdown used by DELAY command
+    /*0x1F6*/ s16 respawnInfoType;              // RESPAWN_INFO_TYPE_*
+    /*0x1F8*/ f32 hitboxRadius;
+    /*0x1FC*/ f32 hitboxHeight;
+    /*0x200*/ f32 hurtboxRadius;
+    /*0x204*/ f32 hurtboxHeight;
+    /*0x208*/ f32 hitboxDownOffset;             // shifts hitbox downward by this amount
+    /*0x20C*/ const BehaviorScript *behavior;   // pointer to the object's behavior array
+    /*0x214*/ struct Object *platform;          // object Mario is standing on (if any)
+    /*0x218*/ void *collisionData;              // pointer to level collision mesh
+    /*0x21C*/ Mat4 transform;                   // 4×4 world transform matrix
+    /*0x25C*/ void *respawnInfo;                // level-specific respawn data
+};
+```
+
+## The rawData union
+
+Bytes `0x088`–`0x1C8` (80 slots of 4 bytes each, index 0x00–0x4F) form an untyped data region that every behavior script uses to store its own per-object variables. The union gives type-safe read/write access to the same memory:
+
+```c
+// include/types.h:154
+union {
+    u32 asU32[0x50];
+    s32 asS32[0x50];
+    s16 asS16[0x50][2];   // two s16 per slot
+    f32 asF32[0x50];
+    // pointer variants (32-bit builds only; 64-bit uses separate ptrData union)
+    struct Object   *asObject[0x50];
+    struct Surface  *asSurface[0x50];
+    void            *asVoidPtr[0x50];
+    // …
+} rawData;
+```
+
+Behaviors never access these slots by raw index. Instead, `object_fields.h` provides named macros that expand to the correct union member and index:
+
+```c
+// include/object_fields.h (selected common fields)
+#define oPosX             OBJECT_FIELD_F32(0x06)
+#define oPosY             OBJECT_FIELD_F32(0x07)
+#define oPosZ             OBJECT_FIELD_F32(0x08)
+#define oVelX             OBJECT_FIELD_F32(0x09)
+#define oVelY             OBJECT_FIELD_F32(0x0A)
+#define oForwardVel       OBJECT_FIELD_F32(0x0C)
+#define oMoveAngleYaw     OBJECT_FIELD_S32(0x10)
+#define oFaceAngleYaw     OBJECT_FIELD_S32(0x13)
+#define oGravity          OBJECT_FIELD_F32(0x17)
+#define oInteractType     OBJECT_FIELD_U32(0x2A)
+#define oInteractStatus   OBJECT_FIELD_S32(0x2B)
+#define oAction           OBJECT_FIELD_S32(0x31)
+#define oTimer            OBJECT_FIELD_S32(0x33)
+#define oDistanceToMario  OBJECT_FIELD_F32(0x35)
+#define oBhvParams        OBJECT_FIELD_S32(0x40)
+#define oHealth           OBJECT_FIELD_S32(0x3F)
+#define oDamageOrCoinValue OBJECT_FIELD_S32(0x3E)
+```
+
+Slots `0x1B`–`0x22` and `0x49`–`0x4A` are reserved for object-specific fields that each behavior defines for itself (e.g. `oGoombaWalkTimer`, `oBooBaseScale`).
+
+<Note>
+  The macro `OBJECT_FIELDS_INDEX_DIRECTLY` is defined in `behavior_data.c` to replace all `OBJECT_FIELD_*` macros with bare array indices. This is only valid in that translation unit, which compiles the raw bytecode tables.
+</Note>
+
+## Object flags
+
+Two separate flag fields control high-level object state.
+
+### activeFlags (`s16`)
+
+```c
+// include/object_constants.h
+#define ACTIVE_FLAG_DEACTIVATED            0
+#define ACTIVE_FLAG_ACTIVE                 (1 <<  0)  // 0x0001 — object is running
+#define ACTIVE_FLAG_FAR_AWAY               (1 <<  1)  // 0x0002 — outside activation radius
+#define ACTIVE_FLAG_IN_DIFFERENT_ROOM      (1 <<  3)  // 0x0008
+#define ACTIVE_FLAG_UNIMPORTANT            (1 <<  4)  // 0x0010 — may be evicted from pool
+#define ACTIVE_FLAG_INITIATED_TIME_STOP    (1 <<  5)  // 0x0020
+#define ACTIVE_FLAG_MOVE_THROUGH_GRATE     (1 <<  6)  // 0x0040
+#define ACTIVE_FLAG_DITHERED_ALPHA         (1 <<  7)  // 0x0080
+```
+
+### oFlags (`u32`, rawData slot 0x01)
+
+```c
+// include/object_constants.h
+#define OBJ_FLAG_UPDATE_GFX_POS_AND_ANGLE        (1 <<  0)
+#define OBJ_FLAG_MOVE_XZ_USING_FVEL              (1 <<  1)
+#define OBJ_FLAG_MOVE_Y_WITH_TERMINAL_VEL        (1 <<  2)
+#define OBJ_FLAG_SET_FACE_YAW_TO_MOVE_YAW        (1 <<  3)
+#define OBJ_FLAG_COMPUTE_DIST_TO_MARIO           (1 <<  6)
+#define OBJ_FLAG_ACTIVE_FROM_AFAR                (1 <<  7)
+#define OBJ_FLAG_TRANSFORM_RELATIVE_TO_PARENT    (1 <<  9)
+#define OBJ_FLAG_HOLDABLE                        (1 << 10)
+#define OBJ_FLAG_COMPUTE_ANGLE_TO_MARIO          (1 << 13)
+#define OBJ_FLAG_PERSISTENT_RESPAWN              (1 << 14)
+```
+
+Most behavior scripts set these with `OR_INT(oFlags, ...)` at the top of their `BEGIN(...)` block.
+
+## Object lists
+
+All 240 object slots live in `gObjectPool[]`. Active objects are organized into 13 doubly-linked lists that determine processing order and collision eligibility:
+
+```c
+// src/game/object_list_processor.h
+enum ObjectList {
+    OBJ_LIST_PLAYER,      //  0 — Mario
+    OBJ_LIST_UNUSED_1,    //  1
+    OBJ_LIST_DESTRUCTIVE, //  2 — bob-ombs, corkboxes
+    OBJ_LIST_UNUSED_3,    //  3
+    OBJ_LIST_GENACTOR,    //  4 — most enemies (Bully, Bullet Bill, MIPS…)
+    OBJ_LIST_PUSHABLE,    //  5 — objects that push each other (Goombas, Koopas)
+    OBJ_LIST_LEVEL,       //  6 — stars, hearts, coins
+    OBJ_LIST_UNUSED_7,    //  7
+    OBJ_LIST_DEFAULT,     //  8 — objects without an explicit BEGIN list
+    OBJ_LIST_SURFACE,     //  9 — surface-collision objects (Thwomp, Whomp)
+    OBJ_LIST_POLELIKE,    // 10 — climbable objects, whirlpools, trees
+    OBJ_LIST_SPAWNER,     // 11 — spawner objects
+    OBJ_LIST_UNIMPORTANT, // 12 — first evicted when the pool is full
+    NUM_OBJ_LISTS         // 13
+};
+```
+
+The list an object joins is set by the first argument of the `BEGIN(objList)` command in its behavior script. Objects only perform collision checks against other objects in compatible lists.
+
+<Note>
+  The pool maximum is 240 objects (`OBJECT_POOL_CAPACITY`). `OBJ_LIST_UNIMPORTANT` objects are silently removed to make room when the pool is exhausted.
+</Note>
+
+## Spawn functions
+
+New objects are created through a family of helpers declared in `src/game/object_helpers.h` (and `src/game/spawn_object.h` for lower-level operations).
+
+<ResponseField name="create_object(bhvScript)" type="struct Object *">
+  Lowest-level allocator. Pulls a slot from `gFreeObjectList`, links it into the appropriate object list (determined by the behavior script's `BEGIN` command), and returns the pointer. Declared in `spawn_object.h`.
+</ResponseField>
+
+<ResponseField name="spawn_object(parent, model, behavior)" type="struct Object *">
+  Creates an object, assigns the given model and behavior, and copies the parent's position and angle. The most common call site in behavior code.
+</ResponseField>
+
+<ResponseField name="spawn_object_at_origin(parent, unused, model, behavior)" type="struct Object *">
+  Like `spawn_object` but does not copy position/angle. Used when the behavior script will set the position itself.
+</ResponseField>
+
+<ResponseField name="spawn_object_relative(bhvParam, relX, relY, relZ, parent, model, behavior)" type="struct Object *">
+  Spawns at a position offset relative to the parent. Sets `oBhvParams2ndByte` from `bhvParam`.
+</ResponseField>
+
+<ResponseField name="try_to_spawn_object(offsetY, scale, parent, model, behavior)" type="struct Object *">
+  Spawns only if object pool slots are available; returns `NULL` otherwise.
+</ResponseField>
+
+<ResponseField name="mark_obj_for_deletion(obj)" type="void">
+  Sets `activeFlags = ACTIVE_FLAG_DEACTIVATED`. The object is recycled into `gFreeObjectList` at the end of the current frame.
+</ResponseField>
+
+## ObjectHitbox struct
+
+Rather than setting hitbox fields manually, many objects use `obj_set_hitbox()` with a statically initialized `struct ObjectHitbox`:
+
+```c
+// include/types.h:204
+struct ObjectHitbox {
+    /*0x00*/ u32 interactType;      // INTERACT_* bitmask (see interaction.h)
+    /*0x04*/ u8  downOffset;        // shifts the hitbox downward (units)
+    /*0x05*/ s8  damageOrCoinValue; // damage dealt, or coin value if collectible
+    /*0x06*/ s8  health;            // starting health points
+    /*0x07*/ s8  numLootCoins;      // coins dropped on death
+    /*0x08*/ s16 radius;            // cylindrical hitbox radius
+    /*0x0A*/ s16 height;            // cylindrical hitbox height
+    /*0x0C*/ s16 hurtboxRadius;     // inner hurtbox (contact damage zone) radius
+    /*0x0E*/ s16 hurtboxHeight;
+};
+```
+
+Example from `src/game/behaviors/coin.inc.c`:
+
+```c
+struct ObjectHitbox sYellowCoinHitbox = {
+    /* interactType:      */ INTERACT_COIN,
+    /* downOffset:        */ 0,
+    /* damageOrCoinValue: */ 1,
+    /* health:            */ 0,
+    /* numLootCoins:      */ 0,
+    /* radius:            */ 100,
+    /* height:            */ 64,
+    /* hurtboxRadius:     */ 0,
+    /* hurtboxHeight:     */ 0,
+};
+```
+
+Calling `obj_set_hitbox(o, &sYellowCoinHitbox)` copies these values into the object's `hitboxRadius`, `hitboxHeight`, `hurtboxRadius`, `hurtboxHeight`, `hitboxDownOffset`, `oInteractType`, `oDamageOrCoinValue`, `oHealth`, and `oNumLootCoins` fields.
+
+## Object lifecycle
+
+<Steps>
+  <Step title="Allocation">
+    `create_object()` pulls an entry from `gFreeObjectList` and zeros its fields. The object is inserted into the linked list for its object type (set by `BEGIN` in the behavior script).
+  </Step>
+
+  <Step title="Initialization (first frame)">
+    On the first tick, the behavior script runs its header commands (`BEGIN`, `OR_INT`, `SET_MODEL`, etc.) and calls any `CALL_NATIVE` init function (e.g. `bhv_yellow_coin_init`). Initialization typically sets up the hitbox, physics parameters, and initial field values.
+  </Step>
+
+  <Step title="Update loop">
+    Every frame, `update_objects()` iterates through all 13 object lists. For each active object it calls `cur_obj_update()`, which advances `curBhvCommand` through the behavior script. Infinite loops (`BEGIN_LOOP` / `END_LOOP`) keep the script running one iteration per frame. `CALL_NATIVE` dispatches C functions that contain the actual game logic.
+  </Step>
+
+  <Step title="Collision and interaction">
+    After behavior updates, the collision system populates each object's `collidedObjs[]` and `collidedObjInteractTypes`. Mario's interaction processor reads these each frame and calls the appropriate handler.
+  </Step>
+
+  <Step title="Deactivation">
+    Setting `activeFlags = ACTIVE_FLAG_DEACTIVATED` (or calling `obj_mark_for_deletion()` / the `DEACTIVATE()` script command) marks the object for removal. At the end of the frame it is unlinked from its object list and returned to `gFreeObjectList`.
+  </Step>
+</Steps>
+
+<Tip>
+  The global `gCurrentObject` always points to the object whose behavior is currently executing. Behavior C functions use the `o` macro (an alias for `gCurrentObject`) and field macros like `o->oPosX` to read and write object state.
+</Tip>
+
+## Time-stop integration
+
+The object list processor respects the `gTimeStopState` flags, which selectively freeze certain lists each frame. For example, `TIME_STOP_ALL_OBJECTS` prevents non-Mario objects from updating, while `TIME_STOP_MARIO_AND_DOORS` restricts only Mario and door objects. Objects that set `ACTIVE_FLAG_INITIATED_TIME_STOP` are the source of the freeze (typically dialog NPCs).
+
+```c
+// src/game/object_list_processor.h
+#define TIME_STOP_ENABLED           (1 << 1)
+#define TIME_STOP_DIALOG            (1 << 2)
+#define TIME_STOP_MARIO_AND_DOORS   (1 << 3)
+#define TIME_STOP_ALL_OBJECTS       (1 << 4)
+#define TIME_STOP_ACTIVE            (1 << 6)
+```

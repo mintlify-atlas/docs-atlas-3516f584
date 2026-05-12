@@ -1,0 +1,284 @@
+---
+title: "Behavior scripts: object bytecode programs"
+description: "How BehaviorScript bytecode drives SM64 objects: command encoding, control flow, CALL_NATIVE dispatch, subroutine stacks, and a full annotated example."
+---
+
+Every object in Super Mario 64 is driven by a **behavior script**: a statically compiled array of `uintptr_t` values (type-aliased as `BehaviorScript`) that acts as a compact bytecode program. The script engine interprets this array one command at a time, advancing a per-object program counter (`curBhvCommand`) each frame. Behaviors mix declarative setup commands (set a field, load a model, configure physics) with control-flow commands (loops, subroutine calls) and `CALL_NATIVE` dispatches that hand off to ordinary C functions for complex logic.
+
+## BehaviorScript type
+
+```c
+// include/types.h:54
+typedef uintptr_t BehaviorScript;
+```
+
+A behavior is declared as `const BehaviorScript bhvFoo[] = { ... };`. On 32-bit N64 hardware each element is 4 bytes. On 64-bit host builds the size doubles, which is why the project has separate `rawData` and `ptrData` unions in `struct Object`.
+
+## Command encoding
+
+Every command word packs a **1-byte opcode** into the most-significant byte, with the remaining 3 bytes carrying arguments:
+
+```c
+// data/behavior_data.c (internal macros used to build words)
+#define BC_B(a)          _SHIFTL(a, 24, 8)                           // opcode only
+#define BC_BB(a, b)      (_SHIFTL(a, 24, 8) | _SHIFTL(b, 16, 8))   // opcode + 1-byte arg
+#define BC_B0H(a, b)     (_SHIFTL(a, 24, 8) | _SHIFTL(b, 0, 16))   // opcode + 2-byte arg
+#define BC_BBH(a, b, c)  (_SHIFTL(a, 24, 8) | _SHIFTL(b, 16, 8) | _SHIFTL(c, 0, 16))
+```
+
+The script engine reads arguments using macros like:
+
+```c
+// src/engine/behavior_script.c
+#define BHV_CMD_GET_2ND_U8(index)  (u8)((gCurBhvCommand[index] >> 16) & 0xFF)
+#define BHV_CMD_GET_2ND_S16(index) (s16)(gCurBhvCommand[index] >> 16)
+#define BHV_CMD_GET_VPTR(index)    (void *)(gCurBhvCommand[index])
+```
+
+Multi-word commands consume additional array elements (e.g. `CALL_NATIVE` is 2 words: opcode word + function pointer word).
+
+## Command reference
+
+<Accordion title="Control flow commands">
+
+| Macro | Opcode | Description |
+|---|---|---|
+| `BEGIN(objList)` | `0x00` | Opens the script; registers the object into the given `ObjectList`. |
+| `DELAY(n)` | `0x01` | Pauses the script for `n` frames by returning `BHV_PROC_BREAK` until `bhvDelayTimer` reaches 0. |
+| `CALL(addr)` | `0x02` | Pushes the next command address onto `bhvStack` and jumps to `addr`. |
+| `RETURN()` | `0x03` | Pops the top of `bhvStack` and resumes from that address. |
+| `GOTO(addr)` | `0x04` | Unconditional jump; does **not** save a return address. |
+| `BEGIN_REPEAT(count)` | `0x05` | Begins a loop that repeats `count` times. |
+| `END_REPEAT()` | `0x06` | Ends the counted loop; returns `BHV_PROC_BREAK` after the last iteration. |
+| `END_REPEAT_CONTINUE()` | `0x07` | Like `END_REPEAT` but continues executing after the loop on the same frame. |
+| `BEGIN_LOOP()` | `0x08` | Marks the start of an infinite loop. |
+| `END_LOOP()` | `0x09` | Jumps back to the matching `BEGIN_LOOP`. |
+| `BREAK()` | `0x0A` | Exits the script for this frame (`BHV_PROC_BREAK`). |
+| `DEACTIVATE()` | `0x1D` | Sets `activeFlags = 0`; object is removed. |
+
+</Accordion>
+
+<Accordion title="Native function call">
+
+```c
+// data/behavior_data.c
+#define CALL_NATIVE(func) \
+    BC_B(0x0C), \
+    BC_PTR(func)
+```
+
+`CALL_NATIVE` is a 2-word command. Opcode `0x0C` tells the engine to read the following word as a function pointer and call it with no arguments. The return value is ignored; the function interacts with the object through `gCurrentObject`. This is how all actual game logic (movement, AI, collision response) is invoked from scripts.
+
+</Accordion>
+
+<Accordion title="Field manipulation commands">
+
+These commands read or write a `rawData` slot by index, eliminating the need for a separate init C function for simple assignments:
+
+| Macro | Opcode | Effect |
+|---|---|---|
+| `SET_FLOAT(field, value)` | `0x0E` | `rawData.asF32[field] = value` |
+| `ADD_FLOAT(field, value)` | `0x0D` | `rawData.asF32[field] += value` |
+| `SET_INT(field, value)` | `0x10` | `rawData.asS32[field] = value` |
+| `ADD_INT(field, value)` | `0x0F` | `rawData.asS32[field] += value` |
+| `OR_INT(field, flags)` | `0x11` | `rawData.asS32[field] \|= flags` |
+
+Example usage — setting `oFlags` at the start of most scripts:
+
+```c
+OR_INT(oFlags, OBJ_FLAG_UPDATE_GFX_POS_AND_ANGLE | OBJ_FLAG_COMPUTE_DIST_TO_MARIO),
+```
+
+</Accordion>
+
+<Accordion title="Object setup commands">
+
+| Macro | Opcode | Description |
+|---|---|---|
+| `SET_MODEL(modelID)` | `0x1B` | Assigns `gLoadedGraphNodes[modelID]` to `sharedChild`. |
+| `BILLBOARD()` | `0x21` | Sets `GRAPH_RENDER_BILLBOARD`; object always faces the camera. |
+| `DISABLE_RENDERING()` | `0x35` | Clears `GRAPH_RENDER_ACTIVE`. |
+| `HIDE()` | `0x22` | Hides the object without deactivating it. |
+| `SET_HOME()` | `0x2D` | Copies current position into `oHomeX/Y/Z`. |
+| `DROP_TO_FLOOR()` | `0x1E` | Snaps `oPosY` to the floor triangle below. |
+| `SCALE(unused, percent)` | `0x32` | Scales the object uniformly. |
+| `LOAD_ANIMATIONS(field, anims)` | `0x27` | Sets `oAnimations` pointer. |
+| `ANIMATE(index)` | `0x28` | Starts animation at the given index. |
+| `LOAD_COLLISION_DATA(ptr)` | `0x2A` | Sets `collisionData`. |
+
+</Accordion>
+
+<Accordion title="Hitbox and physics commands">
+
+```c
+// data/behavior_data.c
+
+// Sets cylindrical hitbox radius and height.
+#define SET_HITBOX(radius, height) \
+    BC_B(0x23), \
+    BC_HH(radius, height)
+
+// Sets cylindrical hitbox with a downward offset.
+#define SET_HITBOX_WITH_OFFSET(radius, height, downOffset) \
+    BC_B(0x2B), \
+    BC_HH(radius, height), \
+    BC_H(downOffset)
+
+// Sets cylindrical hurtbox (inner damage zone).
+#define SET_HURTBOX(radius, height) \
+    BC_B(0x2E), \
+    BC_HH(radius, height)
+
+// Sets the object's interaction type bitmask.
+#define SET_INTERACT_TYPE(type) \
+    BC_B(0x2F), \
+    BC_W(type)
+
+// Configures physics parameters in one command.
+#define SET_OBJ_PHYSICS(wallHitboxRadius, gravity, bounciness, \
+                        dragStrength, friction, buoyancy, unused1, unused2) \
+    BC_B(0x30), \
+    BC_HH(wallHitboxRadius, gravity), \
+    BC_HH(bounciness, dragStrength), \
+    BC_HH(friction, buoyancy), \
+    BC_HH(unused1, unused2)
+```
+
+</Accordion>
+
+<Accordion title="Spawning commands">
+
+| Macro | Opcode | Description |
+|---|---|---|
+| `SPAWN_CHILD(model, behavior)` | `0x1C` | Spawns a child at the parent's position/angle. |
+| `SPAWN_CHILD_WITH_PARAM(param, model, behavior)` | `0x29` | Like `SPAWN_CHILD` but also sets `oBhvParams2ndByte`. |
+| `SPAWN_OBJ(model, behavior)` | `0x2C` | Spawns an object and stores it in `prevObj`. |
+
+</Accordion>
+
+## The bhvStack: subroutine calls
+
+Each object carries an 8-entry call stack:
+
+```c
+// include/types.h
+/*0x1D0*/ u32 bhvStackIndex;
+/*0x1D4*/ uintptr_t bhvStack[8];
+```
+
+The `CALL` command pushes the address of the word **after** the call onto the stack, then jumps to the target. `RETURN` pops the saved address and resumes from there. This lets shared initialization sequences be written once and called from multiple behavior scripts.
+
+```c
+// src/engine/behavior_script.c:94
+static void cur_obj_bhv_stack_push(uintptr_t bhvAddr) {
+    gCurrentObject->bhvStack[gCurrentObject->bhvStackIndex] = bhvAddr;
+    gCurrentObject->bhvStackIndex++;
+}
+
+static uintptr_t cur_obj_bhv_stack_pop(void) {
+    gCurrentObject->bhvStackIndex--;
+    return gCurrentObject->bhvStack[gCurrentObject->bhvStackIndex];
+}
+```
+
+## Real example: bhvYellowCoin
+
+The yellow coin is one of the simplest complete behaviors in the game. Here is the full script from `data/behavior_data.c`, with each command explained:
+
+```c
+const BehaviorScript bhvYellowCoin[] = {
+    BEGIN(OBJ_LIST_LEVEL),
+    // Places this object in OBJ_LIST_LEVEL (stars, hearts, coins).
+
+    BILLBOARD(),
+    // Makes the coin sprite always face the camera (it has no 3-D model).
+
+    OR_INT(oFlags, OBJ_FLAG_COMPUTE_DIST_TO_MARIO | OBJ_FLAG_UPDATE_GFX_POS_AND_ANGLE),
+    // Each frame: recalculate oDistanceToMario, and sync graphics pos/angle
+    // from the logical position fields.
+
+    CALL_NATIVE(bhv_yellow_coin_init),
+    // Runs once on the first frame. Sets the hitbox, snaps to the floor,
+    // deletes itself if the floor is too far below (coin fell through geometry).
+
+    BEGIN_LOOP(),
+        CALL_NATIVE(bhv_yellow_coin_loop),
+        // Every frame: advances oAnimState to spin the texture,
+        // and checks oInteractStatus for collection.
+    END_LOOP(),
+};
+```
+
+And the C functions it calls (`src/game/behaviors/coin.inc.c`):
+
+```c
+void bhv_yellow_coin_init(void) {
+    cur_obj_set_behavior(bhvYellowCoin);
+    obj_set_hitbox(o, &sYellowCoinHitbox); // radius=100, height=64, INTERACT_COIN
+    bhv_init_room();
+    cur_obj_update_floor_height();
+
+    if (500.0f < absf(o->oPosY - o->oFloorHeight)) {
+        cur_obj_set_model(MODEL_YELLOW_COIN_NO_SHADOW);
+    }
+
+    if (o->oFloorHeight < FLOOR_LOWER_LIMIT_MISC) {
+        obj_mark_for_deletion(o);
+    }
+}
+
+void bhv_yellow_coin_loop(void) {
+    bhv_coin_sparkles_init(); // spawn sparkles if collected, then delete self
+    o->oAnimState++;           // advance texture frame (spinning animation)
+}
+```
+
+The `bhvOneCoin` script shows how `GOTO` redirects into the middle of another behavior to share its body:
+
+```c
+const BehaviorScript bhvOneCoin[] = {
+    BEGIN(OBJ_LIST_LEVEL),
+    SET_INT(oBhvParams2ndByte, 1),
+    GOTO(bhvYellowCoin + 1), // jump past bhvYellowCoin's BEGIN, reuse everything else
+};
+```
+
+## How behaviors are assigned to objects
+
+The `behavior` pointer in `struct Object` (at offset `0x20C`) holds the address of the object's behavior script array:
+
+```c
+// include/types.h
+/*0x20C*/ const BehaviorScript *behavior;
+```
+
+When `create_object(bhvScript)` is called, it:
+
+1. Allocates a slot from `gFreeObjectList`.
+2. Stores `bhvScript` in `obj->behavior`.
+3. Sets `obj->curBhvCommand = segmented_to_virtual(bhvScript)` — this is the program counter.
+4. Processes the `BEGIN` command immediately to determine which object list to join.
+
+Each subsequent frame, `cur_obj_update()` resumes from `curBhvCommand` and advances it through commands until a `BREAK`, `DELAY`, or loop-back is hit. The object's position in the script thus persists across frames — the program counter is simply a pointer into the statically allocated array.
+
+<Note>
+  `GOTO` is a raw jump: it replaces `gCurBhvCommand` with no return address. It is typically used to share the body of one behavior with a variant that only differs in initial setup (like `bhvOneCoin` → `bhvYellowCoin`).
+</Note>
+
+## Execution flow per frame
+
+```
+update_objects()
+  └─ for each ObjectList
+       └─ for each active Object in list
+            └─ cur_obj_update()
+                 ├─ gCurrentObject = obj
+                 ├─ gCurBhvCommand = obj->curBhvCommand
+                 └─ loop:
+                      opcode = gCurBhvCommand[0] >> 24
+                      result = sBehaviorFunctionTable[opcode]()
+                      if result == BHV_PROC_BREAK: stop for this frame
+                      else: continue to next command
+```
+
+`BHV_PROC_CONTINUE` (`0`) lets the engine execute the next command in the same frame. `BHV_PROC_BREAK` (`1`) stops and saves `gCurBhvCommand` back into `obj->curBhvCommand` for the next frame. `DELAY` returns `BHV_PROC_BREAK` every frame until the timer expires, effectively pausing the script.

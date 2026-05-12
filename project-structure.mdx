@@ -1,0 +1,222 @@
+---
+title: "Project Structure: SM64 Decompilation Layout"
+description: "A map of every major directory in the SM64 decompilation, from C source and headers to level scripts, actors, audio, and build tools."
+---
+
+The SM64 decompilation is organized so that every part of the original game's source corresponds to a clearly named directory. This page walks through each top-level folder and the most important files inside it.
+
+## Top-level directory overview
+
+```
+sm64/
+├── actors/        # Per-object geo layout, display lists, and behavior data
+├── asm/           # Handwritten MIPS assembly; non-matching stubs
+├── assets/        # Animation sequences and demo input recordings
+├── bin/           # C files controlling display list and texture ordering
+├── build/         # Compiler output (generated; not tracked in git)
+├── data/          # Behavior scripts and miscellaneous data tables
+├── doxygen/       # Doxygen configuration for generating API docs
+├── enhancements/  # Example source modifications and optional features
+├── include/       # Header files shared across the codebase
+├── levels/        # Per-level scripts, geo layout, and display lists
+├── lib/           # Nintendo 64 SDK library code
+├── rsp/           # Audio and Fast3D RSP (Reality Signal Processor) microcode
+├── sound/         # Music sequences, sound samples, and sound banks
+├── src/           # All C source code for the game
+├── text/          # Dialog strings, level names, and act names
+├── textures/      # Skybox panels and shared texture data
+└── tools/         # Build-time asset extraction and conversion scripts
+```
+
+## Source code (`src/`)
+
+The `src/` directory contains all game logic written in C. It is divided into six sub-directories:
+
+<AccordionGroup>
+  <Accordion title="src/game/ — core game logic">
+    The largest source directory. Contains Mario's physics, the object system, rendering, save files, HUD, camera, and all gameplay systems.
+
+    Key files:
+
+    | File | Purpose |
+    |------|---------|
+    | `mario.c` / `mario.h` | Top-level Mario state: position, velocity, health, action dispatch |
+    | `mario_actions_airborne.c` | Airborne actions: jumping, falling, long jump, ground pound |
+    | `mario_actions_moving.c` | Ground movement: walking, running, sliding, crouching |
+    | `mario_actions_submerged.c` | Underwater movement and swimming |
+    | `mario_actions_stationary.c` | Idle, sitting, sleeping, and transition states |
+    | `mario_actions_cutscene.c` | Cutscene-controlled Mario states |
+    | `mario_actions_object.c` | Object-interaction states: carrying, throwing, riding |
+    | `mario_actions_automatic.c` | Automated movement: pole climbing, vine hanging |
+    | `mario_step.c` | Stepping and quarter-step collision resolution |
+    | `mario_misc.c` | Mario model, cap, and miscellaneous helpers |
+    | `camera.c` / `camera.h` | All camera modes, cutscene cameras, lakitu logic |
+    | `object_list_processor.c` | Processes the active object list each frame |
+    | `obj_behaviors.c` | Behavior execution for most interactive objects |
+    | `obj_behaviors_2.c` | Additional behavior execution (overflow from above) |
+    | `object_collision.c` | Object-to-object and object-to-Mario collision |
+    | `object_helpers.c` | Shared utilities used by object behaviors |
+    | `interaction.c` | Mario-object interaction dispatch (coins, enemies, etc.) |
+    | `level_update.c` | Per-frame level tick: area transitions, warp logic |
+    | `area.c` | Area loading, geo graph setup, and skybox selection |
+    | `rendering_graph_node.c` | Geo graph traversal and display list generation |
+    | `geo_misc.c` | Miscellaneous geo node callbacks |
+    | `save_file.c` | EEPROM save/load, star flags, course completion |
+    | `hud.c` | On-screen HUD elements: lives, coins, stars, power meter |
+    | `ingame_menu.c` | Pause menu and in-game selection screens |
+    | `sound_init.c` | Audio system initialization and sequence triggering |
+    | `spawn_object.c` | Object instantiation from behavior data |
+    | `spawn_sound.c` | Sound spawning helpers used by objects and Mario |
+    | `memory.c` | Custom memory allocator (heap segments) |
+    | `game_init.c` | Boot sequence, task scheduling, main game loop entry |
+    | `main.c` | N64 entry point and thread setup |
+    | `shadow.c` | Circular shadow rendering under Mario and objects |
+    | `skybox.c` | Scrolling skybox rendering |
+    | `paintings.c` | Warp painting animation and entry detection |
+    | `envfx_snow.c` | Snow particle effects |
+    | `envfx_bubbles.c` | Bubble particle effects |
+    | `moving_texture.c` | Animated water and lava texture scrolling |
+    | `platform_displacement.c` | Carries Mario on moving platforms |
+    | `screen_transition.c` | Fade in/out transitions between areas |
+    | `debug.c` | Debug display and developer tools |
+    | `print.c` | On-screen text rendering |
+    | `profiler.c` | Frame timing profiler |
+    | `crash_screen.c` | N64 crash handler display |
+  </Accordion>
+
+  <Accordion title="src/engine/ — script engines and math">
+    Contains the interpreters and utilities that drive levels, geo graphs, and object behaviors, plus the core math library.
+
+    | File | Purpose |
+    |------|---------|
+    | `behavior_script.c` / `.h` | Behavior script bytecode interpreter; runs object `bhv` scripts |
+    | `level_script.c` / `.h` | Level script interpreter; loads areas, spawns objects, sets music |
+    | `geo_layout.c` / `.h` | Geo graph script interpreter; builds the scene graph |
+    | `graph_node.c` / `.h` | Geo graph node types and traversal structure |
+    | `graph_node_manager.c` | Allocates and frees geo graph nodes |
+    | `surface_collision.c` / `.h` | Triangle-based floor, wall, and ceiling collision queries |
+    | `surface_load.c` / `.h` | Loads collision surface lists into memory for the current area |
+    | `math_util.c` / `.h` | Fixed-point and floating-point math, matrix operations, trig |
+    | `stub.c` | Empty stubs for functions stripped in certain versions |
+  </Accordion>
+
+  <Accordion title="src/audio/ — audio engine">
+    Houses the software audio sequencer, sound effect player, and ADSR envelope system. The audio engine runs on the N64's RSP in tandem with the game thread.
+
+    The corresponding RSP microcode is in `rsp/`, and the audio data (samples, banks, sequences) lives in `sound/`.
+  </Accordion>
+
+  <Accordion title="src/buffers/ — memory buffers">
+    Declares and reserves stack memory, heap buffers, and task buffers used by the N64 OS task scheduler.
+  </Accordion>
+
+  <Accordion title="src/goddard/ — Mario intro screen">
+    Self-contained module that renders the interactive face on the title screen ("It's-a me, Mario!"). Uses its own renderer and input handler, separate from the main game.
+  </Accordion>
+
+  <Accordion title="src/menu/ — menus">
+    Title screen, file select, act select, and debug level select. Also handles star selection and save-slot management UI.
+  </Accordion>
+</AccordionGroup>
+
+## Headers (`include/`)
+
+Shared header files used across `src/`, `actors/`, and `levels/`.
+
+| File | Purpose |
+|------|---------|
+| `types.h` | Core type definitions: `Vec3f`, `Vec3s`, `Mat4`, `Object`, `MarioState` |
+| `object_fields.h` | Macro accessors for the generic object field array (`oFlags`, `oPosX`, etc.) |
+| `object_constants.h` | Object action and flag constants |
+| `config.h` | Build-time bug fixes and screen/stack size constants, conditioned on `VERSION_*` |
+| `sm64.h` | Global constants: star counts, coin values, health units |
+| `macros.h` | General-purpose macros used throughout the codebase |
+| `behavior_data.h` | Extern declarations for all behavior script arrays |
+| `model_ids.h` | Numeric IDs for all loaded model segments |
+| `seq_ids.h` | Sequence (music track) identifiers |
+| `sounds.h` | Sound effect identifiers |
+| `level_table.h` | Table of all level IDs |
+| `course_table.h` | Table of all course (star-bearing level) IDs |
+| `dialog_ids.h` | IDs for all in-game dialog boxes |
+| `mario_animation_ids.h` | Numeric IDs for all Mario animations |
+| `geo_commands.h` | Macros for writing geo layout scripts |
+| `level_commands.h` | Macros for writing level scripts |
+| `surface_terrains.h` | Surface type and terrain constants (ice, lava, water, etc.) |
+| `ultra64.h` | Nintendo 64 SDK type and function declarations |
+
+## Levels (`levels/`)
+
+Each level has its own subdirectory. Inside each level directory you typically find:
+
+- `script.c` — level script that loads geometry, sets music, spawns macro objects
+- `geo.c` — geo layout script for the level's scene graph
+- `leveldata.c` — display lists and vertex data
+- `collision.c` — collision surface data
+
+Level directories include all 15 main courses, the castle interior, castle grounds, courtyard, Bowser stages, bonus levels, and menu/intro areas:
+
+<AccordionGroup>
+  <Accordion title="Main courses">
+    `bob/` (Bob-omb Battlefield), `wf/` (Whomp's Fortress), `jrb/` (Jolly Roger Bay), `ccm/` (Cool, Cool Mountain), `bbh/` (Big Boo's Haunt), `hmc/` (Hazy Maze Cave), `lll/` (Lethal Lava Land), `ssl/` (Shifting Sand Land), `ddd/` (Dire, Dire Docks), `sl/` (Snowman's Land), `wdw/` (Wet-Dry World), `ttm/` (Tall, Tall Mountain), `thi/` (Tiny-Huge Island), `ttc/` (Tick Tock Clock), `rr/` (Rainbow Ride)
+  </Accordion>
+  <Accordion title="Castle and special areas">
+    `castle_inside/`, `castle_grounds/`, `castle_courtyard/`, `sa/` (Secret Aquarium), `cotmc/` (Cavern of the Metal Cap), `totwc/` (Tower of the Wing Cap), `vcutm/` (Vanish Cap Under the Moat), `pss/` (Princess's Secret Slide), `wmotr/` (Wing Mario Over the Rainbow)
+  </Accordion>
+  <Accordion title="Bowser stages">
+    `bowser_1/`, `bowser_2/`, `bowser_3/`, `bitdw/` (Bowser in the Dark World), `bitfs/` (Bowser in the Fire Sea), `bits/` (Bowser in the Sky)
+  </Accordion>
+  <Accordion title="System areas">
+    `intro/`, `ending/`, `menu/` — title screen, ending cutscene, and file/act select maps. `entry.c` / `entry.h` provide the shared level entry point.
+  </Accordion>
+</AccordionGroup>
+
+## Actors (`actors/`)
+
+Each enemy, NPC, collectible, and interactive object has a subdirectory containing its geo layout script and display list data. Examples include `mario/`, `goomba/`, `bowser/`, `koopa/`, `chain_chomp/`, `star/`, `coin/`, `door/`, `warp_pipe/`, and roughly 150 others.
+
+Group files (`group0.c` through `group17.c`, `common0.c`, `common1.c`) aggregate actors into segment groups for memory management. The `_geo.c` variants contain only the geo layout scripts for those groups.
+
+## Data and assets
+
+| Directory | Contents |
+|-----------|----------|
+| `data/` | Behavior script tables and miscellaneous data arrays |
+| `assets/anims/` | Animation frame data for Mario and other characters |
+| `assets/demos/` | Recorded demo input sequences played on the title screen |
+| `sound/` | Sequences (`.m64`), sound banks, and sample data |
+| `textures/` | Skybox face images and generic shared textures |
+| `text/` | Dialog strings, level names, and act names (localized per version) |
+| `bin/` | C files that control the link order of display lists and textures |
+
+## Assembly (`asm/`)
+
+Hand-written MIPS assembly for sections that cannot yet be matched by the C compiler. The `asm/non_matchings/` subdirectory contains stubs for functions where C reconstruction is in progress.
+
+## Tools (`tools/`)
+
+Build-time Python and C programs used to extract, convert, and assemble assets:
+
+| File / directory | Purpose |
+|-----------------|---------|
+| `assemble_sound.py` | Packages sound sequences and banks into ROM format |
+| `mario_anims_converter.py` | Converts animation data for the build |
+| `demo_data_converter.py` | Converts demo recordings |
+| `aifc_decode.c` | Decodes AIFF-C audio files |
+| `aiff_extract_codebook.c` | Extracts ADPCM codebooks from AIFF files |
+| `skyconv.c` | Converts skybox images |
+| `textconv.c` | Converts dialog and text strings |
+| `seq_decoder.py` | Decodes binary sequence files |
+| `asm-processor/` | Processes inline assembly embedded in C files for the IDO compiler |
+| `ido5.3_compiler/` | Bundled SGI IDO 5.3 compiler (used for matching builds) |
+| `sm64tools/` | Utilities for ROM inspection and patching |
+| `sdk-tools/` | Nintendo 64 SDK tool wrappers |
+
+## Miscellaneous
+
+| Directory | Contents |
+|-----------|----------|
+| `lib/` | Nintendo 64 SDK library object files and headers |
+| `rsp/` | RSP microcode for the audio engine and Fast3D graphics |
+| `enhancements/` | Example patches showing how to extend or modify the game |
+| `doxygen/` | Configuration for generating Doxygen HTML API documentation |
+| `build/` | Generated output directory; contains compiled objects and the final ROM |

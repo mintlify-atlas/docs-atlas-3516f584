@@ -1,0 +1,217 @@
+---
+title: 'Build options and Makefile variables'
+description: 'Complete reference for all SM64 Makefile variables including VERSION, GRUCODE, COMPILER, COMPARE, NON_MATCHING, and CROSS, with examples.'
+---
+
+The SM64 build system is driven by GNU make. Every configurable option is set by passing `VARIABLE=value` on the `make` command line. You can combine multiple variables in a single invocation, and running `make clean` first is recommended when switching between settings that affect compiled output.
+
+The Makefile prints a summary of active options at the start of every build:
+
+```
+==== Build Options ====
+Version:        us
+Microcode:      f3d_old
+Target:         sm64.us
+Compare ROM:    yes
+Build Matching: yes
+=======================
+```
+
+## Variables
+
+### `VERSION`
+
+Selects which release of the game to build.
+
+| Value | Description | Default GRUCODE |
+|-------|-------------|----------------|
+| `us` | 1996 North American release **(default)** | `f3d_old` |
+| `jp` | 1996 Japanese release | `f3d_old` |
+| `eu` | 1997 PAL (European) release | `f3d_new` |
+| `sh` | 1997 Japanese Shindou release (rumble pak support) | `f3d_new` |
+| `cn` | 2003 Chinese iQue Player release | `f3d_new` |
+
+The selected version determines which `baserom.<VERSION>.z64` file is used for asset extraction. A matching baserom must be present before building.
+
+**ROM output names and known SHA-1 hashes:**
+
+| Version | Output file | SHA-1 |
+|---------|-------------|-------|
+| `us` | `sm64.us.z64` | `9bef1128717f958171a4afac3ed78ee2bb4e86ce` |
+| `jp` | `sm64.jp.z64` | `8a20a5c83d6ceb0f0506cfc9fa20d8f438cafe51` |
+| `eu` | `sm64.eu.z64` | `4ac5721683d0e0b6bbb561b58a71740845dceea9` |
+| `sh` | `sm64.sh.z64` | `3f319ae697533a255a1003d09202379d78d5a2e0` |
+| `cn` | `sm64.cn.z64` | `2e1db2780985a1f068077dc0444b685f39cd90ec` |
+
+---
+
+### `GRUCODE`
+
+Selects the RSP (Reality Signal Processor) microcode used for rendering. The default is chosen automatically based on `VERSION`.
+
+| Value | Description |
+|-------|-------------|
+| `f3d_old` | Fast3D (original) — default for `jp` and `us` |
+| `f3d_new` | Fast3D 2.0H — default for `eu`, `sh`, and `cn` |
+| `f3dex` | Fast3DEX |
+| `f3dex2` | Fast3DEX2 |
+| `f3dzex` | Fast3DZEX — experimental microcode from Animal Crossing |
+
+<Warning>
+  `f3dzex` is experimental. Using it is at your own risk and will produce a non-matching ROM.
+</Warning>
+
+<Note>
+  If you select a non-default `GRUCODE` for a given `VERSION`, `COMPARE` is automatically set to `0` because the output will not match the original ROM hash.
+</Note>
+
+---
+
+### `COMPILER`
+
+Selects the C compiler used to build the game code.
+
+| Value | Description |
+|-------|-------------|
+| `ido` | SGI IRIS Development Option compiler **(default)** — required for a bit-exact matching ROM |
+| `gcc` | GNU C Compiler — faster to set up; implies `NON_MATCHING=1` |
+
+When `COMPILER=ido`, the Makefile uses a statically recompiled IDO binary included in the repository's tools directory (`tools/ido-static-recomp`). Alternatively, set `USE_QEMU_IRIX=1` to run the original IRIX binaries under QEMU.
+
+When `COMPILER=gcc`, `NON_MATCHING` is forced to `1` and optimization flags are adjusted accordingly.
+
+---
+
+### `NON_MATCHING`
+
+Controls whether functionally equivalent but non-identical C implementations are used in place of sections that require precise compiler behaviour to match.
+
+| Value | Description |
+|-------|-------------|
+| `0` | Build a matching, byte-identical ROM **(default)** |
+| `1` | Allow non-matching implementations; also avoids undefined behaviour |
+
+Setting `NON_MATCHING=1` automatically sets `COMPARE=0`. This is useful when porting the game or when compiling with GCC, which cannot reproduce the exact code the original IDO compiler generated.
+
+---
+
+### `COMPARE`
+
+Controls whether the Makefile verifies the SHA-1 hash of the built ROM against the known-good hash for the selected version.
+
+| Value | Description |
+|-------|-------------|
+| `1` | Verify SHA-1 hash after building **(default)** |
+| `0` | Skip hash verification |
+
+<Note>
+  Hash verification is automatically disabled when you choose a non-default `GRUCODE` for a version, or when `NON_MATCHING=1`. A hash mismatch is expected when modifying the codebase and is not treated as a build failure unless `COMPARE=1`.
+</Note>
+
+---
+
+### `CROSS`
+
+Overrides the auto-detected MIPS cross-compiler toolchain prefix.
+
+The Makefile probes for the following prefixes in order and uses the first one found:
+
+1. `mips-linux-gnu-`
+2. `mips64-linux-gnu-`
+3. `mips64-elf-`
+
+Set `CROSS` explicitly if your toolchain uses a different prefix or if auto-detection fails:
+
+```bash
+make CROSS=mips64-linux-gnu- VERSION=us -j4
+```
+
+---
+
+### `USE_QEMU_IRIX`
+
+Only relevant when `COMPILER=ido`. Selects how the IRIX compiler binaries are emulated.
+
+| Value | Description |
+|-------|-------------|
+| `0` | Use statically recompiled IRIX binaries **(default)** |
+| `1` | Use `qemu-irix` to run original IRIX binaries |
+
+When `USE_QEMU_IRIX=1`, the `QEMU_IRIX` environment variable must point to the `qemu-irix` binary, or the `qemu-irix` package must be installed and on your `PATH`.
+
+---
+
+### `VERBOSE`
+
+| Value | Description |
+|-------|-------------|
+| `0` | Suppress individual command output **(default)** |
+| `1` | Print every compiler and linker invocation |
+
+---
+
+### `COLOR`
+
+| Value | Description |
+|-------|-------------|
+| `1` | Colorize build status messages **(default)** |
+| `0` | Disable color output |
+
+## Example commands
+
+<CodeGroup>
+
+```bash Build US version (defaults)
+make
+```
+
+```bash Build JP version with 4 parallel jobs
+make VERSION=jp -j4
+```
+
+```bash Build EU version, skip hash verification
+make VERSION=eu COMPARE=0 -j4
+```
+
+```bash Non-matching build with GCC
+make COMPILER=gcc NON_MATCHING=1 -j4
+```
+
+```bash Explicit toolchain prefix
+make VERSION=us CROSS=mips64-linux-gnu- -j4
+```
+
+```bash Verbose output for debugging
+make VERSION=us VERBOSE=1
+```
+
+</CodeGroup>
+
+## Build output
+
+All artifacts are placed under the `build/` directory, organized by version:
+
+```
+build/
+└── us/
+    ├── sm64.us.z64      # Final ROM
+    ├── sm64.us.elf      # ELF file (useful for debugging)
+    ├── sm64.us.map      # Linker map
+    └── ...              # Intermediate object files
+```
+
+To clean all build artifacts and start fresh:
+
+```bash
+make clean
+```
+
+To also clean extracted assets and tool binaries:
+
+```bash
+make distclean
+```
+
+<Warning>
+  Ensure the full path to your repository does not exceed 255 characters. Long path names cause build errors due to OS filename length limits.
+</Warning>

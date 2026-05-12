@@ -1,0 +1,420 @@
+---
+title: "Mario's action state machine and dispatch system"
+description: "How SM64's action state machine works: execute_mario_action() dispatches per action group, and set_mario_action() transitions states with entry-side effects."
+---
+
+Every aspect of Mario's moment-to-moment behavior is driven by a **single active action** stored in `MarioState.action`. Each frame, `execute_mario_action()` reads that value, selects the appropriate group executor, and runs the corresponding handler function. Transitions between actions are performed through a small family of setter functions that apply entry-side effects before committing the new action.
+
+The design means that adding or modifying behavior generally requires either editing an existing `act_*` handler or writing a new one and registering it in the group's switch statement.
+
+---
+
+## Action value layout
+
+An action value is a 32-bit integer where the bits serve two roles simultaneously:
+
+```
+ 31      24       16       9  8  7  6  5  4  3  2  1  0
+ |  ACT_FLAG_*  bits  |  group |      ACT ID (0x1FF)    |
+```
+
+The lower 9 bits (`ACT_ID_MASK = 0x1FF`) are the unique index within the action's group. Bits 6–8 form the **group field** (`ACT_GROUP_MASK = 0x1C0`). Bits 9–31 are **flag bits** that expose properties of the action to code that does not need to know the exact action:
+
+```c
+// include/sm64.h — group constants
+#define ACT_GROUP_MASK       0x000001C0
+#define ACT_GROUP_STATIONARY /* 0x00000000 */ (0 << 6)
+#define ACT_GROUP_MOVING     /* 0x00000040 */ (1 << 6)
+#define ACT_GROUP_AIRBORNE   /* 0x00000080 */ (2 << 6)
+#define ACT_GROUP_SUBMERGED  /* 0x000000C0 */ (3 << 6)
+#define ACT_GROUP_CUTSCENE   /* 0x00000100 */ (4 << 6)
+#define ACT_GROUP_AUTOMATIC  /* 0x00000140 */ (5 << 6)
+#define ACT_GROUP_OBJECT     /* 0x00000180 */ (6 << 6)
+
+// include/sm64.h — flag bits (bits 9–31)
+#define ACT_FLAG_STATIONARY                  /* 0x00000200 */ (1 <<  9)
+#define ACT_FLAG_MOVING                      /* 0x00000400 */ (1 << 10)
+#define ACT_FLAG_AIR                         /* 0x00000800 */ (1 << 11)
+#define ACT_FLAG_INTANGIBLE                  /* 0x00001000 */ (1 << 12)
+#define ACT_FLAG_SWIMMING                    /* 0x00002000 */ (1 << 13)
+#define ACT_FLAG_METAL_WATER                 /* 0x00004000 */ (1 << 14)
+#define ACT_FLAG_SHORT_HITBOX                /* 0x00008000 */ (1 << 15)
+#define ACT_FLAG_RIDING_SHELL                /* 0x00010000 */ (1 << 16)
+#define ACT_FLAG_INVULNERABLE                /* 0x00020000 */ (1 << 17)
+#define ACT_FLAG_BUTT_OR_STOMACH_SLIDE       /* 0x00040000 */ (1 << 18)
+#define ACT_FLAG_DIVING                      /* 0x00080000 */ (1 << 19)
+#define ACT_FLAG_ON_POLE                     /* 0x00100000 */ (1 << 20)
+#define ACT_FLAG_HANGING                     /* 0x00200000 */ (1 << 21)
+#define ACT_FLAG_IDLE                        /* 0x00400000 */ (1 << 22)
+#define ACT_FLAG_ATTACKING                   /* 0x00800000 */ (1 << 23)
+#define ACT_FLAG_ALLOW_VERTICAL_WIND_ACTION  /* 0x01000000 */ (1 << 24)
+#define ACT_FLAG_CONTROL_JUMP_HEIGHT         /* 0x02000000 */ (1 << 25)
+#define ACT_FLAG_ALLOW_FIRST_PERSON          /* 0x04000000 */ (1 << 26)
+#define ACT_FLAG_PAUSE_EXIT                  /* 0x08000000 */ (1 << 27)
+#define ACT_FLAG_SWIMMING_OR_FLYING          /* 0x10000000 */ (1 << 28)
+#define ACT_FLAG_WATER_OR_TEXT               /* 0x20000000 */ (1 << 29)
+#define ACT_FLAG_THROWING                    /* 0x80000000 */ (1 << 31)
+```
+
+For example, `ACT_WALKING = 0x04000440` decodes as:
+- ID `0x040` within the moving group
+- `ACT_GROUP_MOVING` (`0x40`)
+- `ACT_FLAG_MOVING` (`0x400`)
+- `ACT_FLAG_ALLOW_FIRST_PERSON` (`0x04000000`)
+
+---
+
+## execute_mario_action()
+
+This function is called once per frame from the object behavior of Mario's object (`bhvMario`). It is declared in `src/game/mario.h` and implemented in `src/game/mario.c`.
+
+```c
+s32 execute_mario_action(UNUSED struct Object *o);
+```
+
+The implementation (abridged from `src/game/mario.c:1702`):
+
+```c
+s32 execute_mario_action(UNUSED struct Object *o) {
+    s32 inLoop = TRUE;
+
+    if (gMarioState->action) {
+        gMarioState->marioObj->header.gfx.node.flags &= ~GRAPH_RENDER_INVISIBLE;
+        mario_reset_bodystate(gMarioState);
+        update_mario_inputs(gMarioState);
+        mario_handle_special_floors(gMarioState);
+        mario_process_interactions(gMarioState);
+
+        // If Mario is OOB (no floor), stop executing actions.
+        if (gMarioState->floor == NULL) {
+            return 0;
+        }
+
+        // Loop allows multiple action shifts in one frame.
+        while (inLoop) {
+            switch (gMarioState->action & ACT_GROUP_MASK) {
+                case ACT_GROUP_STATIONARY:
+                    inLoop = mario_execute_stationary_action(gMarioState);
+                    break;
+                case ACT_GROUP_MOVING:
+                    inLoop = mario_execute_moving_action(gMarioState);
+                    break;
+                case ACT_GROUP_AIRBORNE:
+                    inLoop = mario_execute_airborne_action(gMarioState);
+                    break;
+                case ACT_GROUP_SUBMERGED:
+                    inLoop = mario_execute_submerged_action(gMarioState);
+                    break;
+                case ACT_GROUP_CUTSCENE:
+                    inLoop = mario_execute_cutscene_action(gMarioState);
+                    break;
+                case ACT_GROUP_AUTOMATIC:
+                    inLoop = mario_execute_automatic_action(gMarioState);
+                    break;
+                case ACT_GROUP_OBJECT:
+                    inLoop = mario_execute_object_action(gMarioState);
+                    break;
+            }
+        }
+
+        // Post-action updates
+        sink_mario_in_quicksand(gMarioState);
+        squish_mario_model(gMarioState);
+        update_mario_health(gMarioState);
+        update_mario_info_for_cam(gMarioState);
+        mario_update_hitbox_and_cap_model(gMarioState);
+
+        return gMarioState->particleFlags;
+    }
+
+    return 0;
+}
+```
+
+<Note>
+  The `while (inLoop)` loop is intentional. When a group executor calls `set_mario_action()` and returns `TRUE`, the loop immediately re-dispatches to the new action's group within the same frame. This can chain multiple action transitions in a single tick — for example, landing from a jump can chain directly into a walk step without a one-frame gap.
+</Note>
+
+---
+
+## Action source files
+
+Each group executor and its `act_*` handlers live in a dedicated file:
+
+<CardGroup cols={2}>
+  <Card title="mario_actions_stationary.c" icon="circle-pause">
+    Idle, sleeping, crouching, reading signs, star dance, death animations, and all landing-stop actions. Group `ACT_GROUP_STATIONARY`.
+  </Card>
+  <Card title="mario_actions_moving.c" icon="person-walking">
+    Walking, running, braking, butt slide, stomach slide, dive slide, ground knockback, and landing roll actions. Group `ACT_GROUP_MOVING`.
+  </Card>
+  <Card title="mario_actions_airborne.c" icon="arrow-up">
+    Jump, double jump, triple jump, backflip, long jump, side flip, wall kick, freefall, dive, flying, twirling, ground pound, lava boost, and airborne knockback. Group `ACT_GROUP_AIRBORNE`.
+  </Card>
+  <Card title="mario_actions_submerged.c" icon="water">
+    Water idle, breaststroke, flutter kick, water throw, water punch, water plunge, metal-water variants, drowning, whirlpool. Group `ACT_GROUP_SUBMERGED`.
+  </Card>
+  <Card title="mario_actions_automatic.c" icon="arrows-spin">
+    Pole climbing, ceiling hanging, hang-moving, ledge grab, ledge climb, cannon, Hoot riding, tornado twirl. Group `ACT_GROUP_AUTOMATIC`.
+  </Card>
+  <Card title="mario_actions_cutscene.c" icon="film">
+    Intro cutscene, star dance, door transitions, warp spawns, death exits, credits, reading NPC dialog, Bowser throw. Group `ACT_GROUP_CUTSCENE`.
+  </Card>
+  <Card title="mario_actions_object.c" icon="box">
+    Punching, picking up objects, placing down, throwing, heavy throw, picking up Bowser, holding Bowser, releasing Bowser. Group `ACT_GROUP_OBJECT`.
+  </Card>
+</CardGroup>
+
+Each group executor (`mario_execute_moving_action`, etc.) contains a `switch` on the lower action ID bits and calls the appropriate `act_*` function, returning its result to the `inLoop` check in `execute_mario_action()`.
+
+---
+
+## Action handler signature
+
+Every action handler follows the same signature and return convention:
+
+```c
+// From src/game/mario_actions_airborne.c:446
+s32 act_jump(struct MarioState *m) {
+    if (check_kick_or_dive_in_air(m)) {
+        return TRUE;
+    }
+
+    if (m->input & INPUT_Z_PRESSED) {
+        return set_mario_action(m, ACT_GROUND_POUND, 0);
+    }
+
+    play_mario_sound(m, SOUND_ACTION_TERRAIN_JUMP, 0);
+    common_air_action_step(m, ACT_JUMP_LAND, MARIO_ANIM_SINGLE_JUMP,
+                           AIR_STEP_CHECK_LEDGE_GRAB | AIR_STEP_CHECK_HANG);
+    return FALSE;
+}
+```
+
+- **Return `FALSE`** — action continues normally next frame (`inLoop = FALSE` stops the while loop).
+- **Return `TRUE`** — action changed internally; the while loop will re-dispatch within this frame.
+- Calling `set_mario_action(m, NEW_ACTION, arg)` and returning its result (`TRUE`) is the standard transition pattern.
+
+---
+
+## Key action-setting functions
+
+All declared in `src/game/mario.h`, implemented in `src/game/mario.c`:
+
+<ResponseField name="set_mario_action(m, action, actionArg)" type="u32">
+  The core transition function. Dispatches to a group-specific entry helper (e.g. `set_mario_action_airborne`) that sets initial velocity values for the new action, then commits by writing `action`, `prevAction`, `actionArg`, `actionState = 0`, and `actionTimer = 0`.
+
+  ```c
+  // mario.c:979
+  u32 set_mario_action(struct MarioState *m, u32 action, u32 actionArg) {
+      switch (action & ACT_GROUP_MASK) {
+          case ACT_GROUP_MOVING:
+              action = set_mario_action_moving(m, action, actionArg);
+              break;
+          case ACT_GROUP_AIRBORNE:
+              action = set_mario_action_airborne(m, action, actionArg);
+              break;
+          // ...
+      }
+      m->flags &= ~(MARIO_ACTION_SOUND_PLAYED | MARIO_MARIO_SOUND_PLAYED);
+      m->prevAction = m->action;
+      m->action     = action;
+      m->actionArg  = actionArg;
+      m->actionState = 0;
+      m->actionTimer = 0;
+      return TRUE;
+  }
+  ```
+</ResponseField>
+
+<ResponseField name="drop_and_set_mario_action(m, action, actionArg)" type="s32">
+  Calls `mario_stop_riding_and_holding(m)` to drop any held or ridden object, then calls `set_mario_action()`. Used whenever a transition must cleanly release objects (e.g. damage knockback while carrying something).
+
+  ```c
+  // mario.c:1098
+  s32 drop_and_set_mario_action(struct MarioState *m, u32 action, u32 actionArg) {
+      mario_stop_riding_and_holding(m);
+      return set_mario_action(m, action, actionArg);
+  }
+  ```
+</ResponseField>
+
+<ResponseField name="hurt_and_set_mario_action(m, action, actionArg, hurtCounter)" type="s32">
+  Sets `m->hurtCounter` to the given value (which drives the hurt animation countdown), then calls `set_mario_action()`. Used by all damage-dealing interactions.
+
+  ```c
+  // mario.c:1107
+  s32 hurt_and_set_mario_action(struct MarioState *m, u32 action, u32 actionArg, s16 hurtCounter) {
+      m->hurtCounter = hurtCounter;
+      return set_mario_action(m, action, actionArg);
+  }
+  ```
+</ResponseField>
+
+<ResponseField name="set_jump_from_landing(m)" type="s32">
+  Selects the correct jump action based on `m->prevAction` and `m->doubleJumpTimer`. Handles the single → double → triple jump chain, steep-slope jump override, and quicksand jump variant.
+
+  ```c
+  // mario.c:1018
+  s32 set_jump_from_landing(struct MarioState *m) {
+      // quicksand and steep slope checks first,
+      // then inspects prevAction for jump chain:
+      // ACT_JUMP_LAND      → ACT_DOUBLE_JUMP
+      // ACT_DOUBLE_JUMP_LAND → ACT_TRIPLE_JUMP (if speed > 20 or wing cap)
+      // default            → ACT_JUMP
+      m->doubleJumpTimer = 0;
+      return TRUE;
+  }
+  ```
+</ResponseField>
+
+<ResponseField name="set_jumping_action(m, action, actionArg)" type="s32">
+  Applies quicksand and steep-slope overrides, then falls through to `set_mario_action()`. Used by actions that want to initiate a jump but respect terrain constraints.
+</ResponseField>
+
+<ResponseField name="transition_submerged_to_walking(m)" type="s32">
+  Resets `angleVel`, restores the camera to its default mode, then transitions to `ACT_WALKING` or `ACT_HOLD_WALKING` depending on whether Mario is holding an object. Called when Mario surfaces from water.
+
+  ```c
+  // mario.c:1158
+  s32 transition_submerged_to_walking(struct MarioState *m) {
+      set_camera_mode(m->area->camera, m->area->camera->defMode, 1);
+      vec3s_set(m->angleVel, 0, 0, 0);
+      if (m->heldObj == NULL) {
+          return set_mario_action(m, ACT_WALKING, 0);
+      } else {
+          return set_mario_action(m, ACT_HOLD_WALKING, 0);
+      }
+  }
+  ```
+</ResponseField>
+
+---
+
+## Common action exit checks
+
+Two helper functions implement the standard input checks shared across many stationary and moving action handlers:
+
+```c
+// mario.c:1117
+s32 check_common_action_exits(struct MarioState *m) {
+    if (m->input & INPUT_A_PRESSED)      return set_mario_action(m, ACT_JUMP, 0);
+    if (m->input & INPUT_OFF_FLOOR)      return set_mario_action(m, ACT_FREEFALL, 0);
+    if (m->input & INPUT_NONZERO_ANALOG) return set_mario_action(m, ACT_WALKING, 0);
+    if (m->input & INPUT_ABOVE_SLIDE)    return set_mario_action(m, ACT_BEGIN_SLIDING, 0);
+    return FALSE;
+}
+
+// mario.c:1138
+s32 check_common_hold_action_exits(struct MarioState *m) {
+    if (m->input & INPUT_A_PRESSED)      return set_mario_action(m, ACT_HOLD_JUMP, 0);
+    if (m->input & INPUT_OFF_FLOOR)      return set_mario_action(m, ACT_HOLD_FREEFALL, 0);
+    if (m->input & INPUT_NONZERO_ANALOG) return set_mario_action(m, ACT_HOLD_WALKING, 0);
+    if (m->input & INPUT_ABOVE_SLIDE)    return set_mario_action(m, ACT_HOLD_BEGIN_SLIDING, 0);
+    return FALSE;
+}
+```
+
+These are called near the top of most idle and landing-stop handlers so that any of the four standard inputs immediately transitions out.
+
+---
+
+## Selected action constants
+
+<Accordion title="Stationary actions (group 0x000)">
+```c
+#define ACT_IDLE              0x0C400201 // standing still, idle animations
+#define ACT_SLEEPING          0x0C000203 // full sleep animation
+#define ACT_PANTING           0x0C400205 // out of breath
+#define ACT_CROUCHING         0x0C008220 // short hitbox
+#define ACT_JUMP_LAND_STOP    0x0C000230 // brief landing pause after a jump
+#define ACT_DOUBLE_JUMP_LAND_STOP 0x0C000231
+#define ACT_FREEFALL_LAND_STOP    0x0C000232
+#define ACT_GROUND_POUND_LAND 0x0080023C // attacking on land
+#define ACT_IN_QUICKSAND      0x0002020D // sinking, invulnerable
+```
+</Accordion>
+
+<Accordion title="Moving actions (group 0x040)">
+```c
+#define ACT_WALKING           0x04000440
+#define ACT_HOLD_WALKING      0x00000442
+#define ACT_BRAKING           0x04000445
+#define ACT_BUTT_SLIDE        0x00840452 // attacking
+#define ACT_STOMACH_SLIDE     0x008C0453 // diving + attacking
+#define ACT_DIVE_SLIDE        0x00880456
+#define ACT_HARD_BACKWARD_GROUND_KB 0x00020460 // invulnerable
+#define ACT_JUMP_LAND         0x04000470 // rolling landing
+#define ACT_TRIPLE_JUMP_LAND  0x04000478
+#define ACT_LONG_JUMP_LAND    0x00000479
+#define ACT_BACKFLIP_LAND     0x0400047A
+```
+</Accordion>
+
+<Accordion title="Airborne actions (group 0x080)">
+```c
+#define ACT_JUMP              0x03000880 // controllable jump height
+#define ACT_DOUBLE_JUMP       0x03000881
+#define ACT_TRIPLE_JUMP       0x01000882
+#define ACT_BACKFLIP          0x01000883
+#define ACT_WALL_KICK_AIR     0x03000886
+#define ACT_SIDE_FLIP         0x01000887
+#define ACT_LONG_JUMP         0x03000888
+#define ACT_DIVE              0x0188088A // diving + attacking
+#define ACT_FREEFALL          0x0100088C
+#define ACT_FLYING            0x10880899 // wing cap
+#define ACT_GROUND_POUND      0x008008A9 // attacking
+#define ACT_LAVA_BOOST        0x010208B7 // invulnerable
+```
+</Accordion>
+
+<Accordion title="Submerged actions (group 0x0C0)">
+```c
+#define ACT_WATER_IDLE        0x380022C0
+#define ACT_BREASTSTROKE      0x300024D0
+#define ACT_FLUTTER_KICK      0x300024D2
+#define ACT_WATER_PLUNGE      0x300022E2 // entering water
+#define ACT_DROWNING          0x300032C4 // intangible
+#define ACT_METAL_WATER_WALKING 0x000044F2
+```
+</Accordion>
+
+<Accordion title="Automatic actions (group 0x140)">
+```c
+#define ACT_HOLDING_POLE      0x08100340 // on pole
+#define ACT_CLIMBING_POLE     0x00100343
+#define ACT_HANGING           0x00200349 // ceiling hang
+#define ACT_LEDGE_GRAB        0x0800034B
+#define ACT_LEDGE_CLIMB_FAST  0x0000054F
+#define ACT_IN_CANNON         0x00001371
+```
+</Accordion>
+
+---
+
+## Build flags: NON_MATCHING and AVOID_UB
+
+The decomp uses two compile-time defines that affect action code behavior:
+
+<ResponseField name="NON_MATCHING" type="build flag">
+  When set, allows GCC/Clang to be used instead of the original SGI IDO compiler. Required for non-N64 builds. Code conditioned on `#ifndef NON_MATCHING` contains GLOBAL_ASM blocks or other IDO-specific constructs that only compile with the original toolchain.
+</ResponseField>
+
+<ResponseField name="AVOID_UB" type="build flag">
+  When set, patches sources of undefined behavior that happen to work on MIPS/IDO but are illegal in standard C. The key example is `BAD_RETURN`, defined in `include/types.h`:
+
+  ```c
+  // include/types.h:16
+  #ifdef AVOID_UB
+      #define BAD_RETURN(cmd) void
+  #else
+      #define BAD_RETURN(cmd) cmd
+  #endif
+  ```
+
+  Functions marked `BAD_RETURN(s32)` are declared with a return type but do not actually return a value in all paths. With `AVOID_UB=1` they become `void` functions, avoiding the undefined behavior that modern compilers may exploit for misoptimisation. `macros.h` enforces that non-IDO builds must define both `NON_MATCHING=1` and `AVOID_UB=1`.
+</ResponseField>
+
+<Warning>
+  The action loop can theoretically hang if two actions mutually `set_mario_action()` to each other and both return `TRUE`. No such cycle exists in the shipped game, but it is something to be aware of when adding new actions or modifying transition logic.
+</Warning>

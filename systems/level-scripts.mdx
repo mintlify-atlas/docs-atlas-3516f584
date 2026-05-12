@@ -1,0 +1,340 @@
+---
+title: "Level scripts: loading and initializing SM64 levels"
+description: "How SM64's LevelScript command arrays load segments, define areas, place objects, wire up warp nodes, and set music for every level in the game."
+---
+
+A level script is a statically defined array of `LevelScript` (i.e. `uintptr_t`) values that drives the entire lifecycle of loading a level — from decompressing ROM data into RAM segments, through spawning every object and warp node, to handing control over to the game loop. The interpreter lives in `src/engine/level_script.c` and is entered through `level_script_execute()`.
+
+## The command interpreter
+
+```c
+struct LevelCommand {
+    u8 type;
+    u8 size;
+    // variable-length argument data follows
+};
+```
+
+`level_script_execute()` is called each game frame while the script is running. It dispatches on `type`, advances `sCurrentCmd` by `size << CMD_SIZE_SHIFT` after each command, and returns when the script pauses (waiting for a DMA transfer) or halts. A 32-entry `uintptr_t` stack (`sStack`) supports `JUMP_LINK` / `RETURN` subroutine calls between script arrays.
+
+```c
+enum ScriptStatus {
+    SCRIPT_RUNNING =  1,
+    SCRIPT_PAUSED  =  0,
+    SCRIPT_PAUSED2 = -1,
+};
+```
+
+A built-in register (`sRegister`) and comparison operators (`OP_AND`, `OP_EQ`, `OP_LT`, etc.) allow conditional branching inside a script without needing separate C functions.
+
+## Command reference
+
+### Memory and segment loading
+
+<Accordion title="EXECUTE / EXIT_AND_EXECUTE — load a segment and jump to a new script">
+```c
+// Load romStart..romEnd into segment seg, then call entry
+EXECUTE(seg, script, scriptEnd, entry)
+
+// Same, but clears the current script stack first
+EXIT_AND_EXECUTE(seg, script, scriptEnd, entry)
+```
+These are the primary way the game switches between level entry points. The global level list in `levels/scripts.c` is a chain of `EXECUTE` commands.
+</Accordion>
+
+<Accordion title="LOAD_MIO0 / LOAD_RAW / LOAD_MIO0_TEXTURE — segment DMA">
+```c
+// Decompress MIO0-compressed ROM data into segment
+LOAD_MIO0(seg, romStart, romEnd)
+
+// Copy raw ROM data into segment (uncompressed)
+LOAD_RAW(seg, romStart, romEnd)
+
+// Load MIO0 texture bank into segment (same opcode space)
+LOAD_MIO0_TEXTURE(seg, romStart, romEnd)
+
+// Load to a fixed RAM address
+FIXED_LOAD(loadAddr, romStart, romEnd)
+```
+Segments are numbered 0x05–0x0F. Common conventions: 0x07 = level geometry, 0x08–0x0F = shared actor groups.
+</Accordion>
+
+<Accordion title="ALLOC_LEVEL_POOL / FREE_LEVEL_POOL — level memory pool">
+```c
+ALLOC_LEVEL_POOL()  // allocate the per-level heap region
+FREE_LEVEL_POOL()   // release it when leaving the level
+```
+Everything allocated between these two commands (graph nodes, collision data, object lists) lives in the level pool.
+</Accordion>
+
+### Level initialization
+
+```c
+INIT_LEVEL()   // reset global level state, timer, star flags, etc.
+CLEAR_LEVEL()  // called on exit; tears down the level state
+```
+
+### Model loading
+
+<Accordion title="LOAD_MODEL_FROM_GEO / LOAD_MODEL_FROM_DL">
+```c
+// Build a GraphNode tree from a geo layout and assign it model slot `model`
+LOAD_MODEL_FROM_GEO(model, geo)
+
+// Assign a raw display list to a model slot with a specific rendering layer
+LOAD_MODEL_FROM_DL(model, dl, layer)
+```
+Once loaded, objects reference models by their integer slot. `MODEL_MARIO`, `MODEL_BOB_BUBBLY_TREE`, etc. are defined in `model_ids.h`.
+</Accordion>
+
+### Area definition
+
+```c
+// Open an area block: associates area index with its geo layout root
+AREA(index, geo)
+
+    // … object placement, warp nodes, terrain, music commands …
+
+// Close the area block
+END_AREA()
+```
+
+Each level has at most a handful of areas (usually 1–3). The `geo` argument points to the `GeoLayout` array that builds the scene graph for that area. Areas are identified by a 1-based `index`; the level script interpreter stores the current area in `sCurrAreaIndex`.
+
+### Object placement
+
+<Accordion title="OBJECT — place a game object">
+```c
+// Spawn object in all 6 acts
+OBJECT(model, posX, posY, posZ, angleX, angleY, angleZ, bhvParam, bhv)
+
+// Spawn object only during specific acts (bitmask)
+OBJECT_WITH_ACTS(model, posX, posY, posZ, angleX, angleY, angleZ, bhvParam, bhv, acts)
+
+// Special macro: spawn Mario
+MARIO(model, bhvArg, bhv)
+```
+`bhv` is a pointer to a behavior script array. `bhvParam` is a packed 32-bit value read by the behavior; helpers like `BPARAM1()` / `BPARAM2()` pack individual bytes.
+</Accordion>
+
+<Accordion title="MACRO_OBJECTS — bulk object list">
+```c
+// Load a list of lightweight macro objects (coins, goombas, etc.)
+MACRO_OBJECTS(objList)
+```
+Macro objects are more compact than full `OBJECT` commands and are loaded in a batch from a `MacroObject` array embedded in the level geometry segment.
+</Accordion>
+
+### Warp nodes
+
+<Accordion title="WARP_NODE — define a warp destination">
+```c
+// Regular warp (entering a painting, door, etc.)
+WARP_NODE(id, destLevel, destArea, destNode, flags)
+
+// Painting warp (triggers the painting warp animation)
+PAINTING_WARP_NODE(id, destLevel, destArea, destNode, flags)
+
+// Instant warp (teleport Mario within the same level with a position offset)
+INSTANT_WARP(index, destArea, displaceX, displaceY, displaceZ)
+```
+`flags` is either `WARP_NO_CHECKPOINT` (0x00) or `WARP_CHECKPOINT` (0x80). `WARP_NODE_SUCCESS` and `WARP_NODE_DEATH` are the reserved IDs for star-collection and death exits.
+</Accordion>
+
+### Collision and terrain
+
+```c
+// Load the level's collision mesh from a segmented pointer
+TERRAIN(terrainData)
+
+// Load per-surface room indices (used for camera room transitions)
+ROOMS(surfaceRooms)
+
+// Set the global terrain sound type (grass, snow, sand, etc.)
+TERRAIN_TYPE(terrainType)
+
+// Set the position Mario starts at in an area
+MARIO_POS(area, yaw, posX, posY, posZ)
+```
+
+### Audio
+
+```c
+// Set the level's background music sequence and audio settings preset
+SET_BACKGROUND_MUSIC(settingsPreset, seq)
+
+// Set music for menu/pause screens
+SET_MENU_MUSIC(seq)
+
+// Fade out and stop current music
+STOP_MUSIC(fadeOutTime)
+```
+
+### Flow control
+
+```c
+JUMP(target)                 // unconditional jump to another script array
+JUMP_LINK(target)            // call subroutine (pushes return address)
+RETURN()                     // return from JUMP_LINK
+JUMP_IF(op, arg, target)     // conditional jump based on sRegister
+JUMP_LINK_IF(op, arg, target)// conditional call
+LOOP_BEGIN()                 // mark loop start
+LOOP_UNTIL(op, arg)          // loop back while condition false
+SET_REG(value)               // set sRegister
+GET_OR_SET(op, var)          // get/set a game variable into sRegister
+SLEEP(frames)                // pause script execution for N frames
+SLEEP_BEFORE_EXIT(frames)    // pause then exit level
+EXIT()                       // terminate the level script
+```
+
+### Miscellaneous
+
+```c
+SHOW_DIALOG(index, dialogID) // show a textbox when entering the area
+TRANSITION(transType, time, colorR, colorG, colorB) // screen wipe effect
+BLACKOUT(active)             // force screen black
+GAMMA(enabled)               // toggle gamma correction
+LOAD_MARIO_HEAD(sethead)     // Goddard face selector
+WHIRLPOOL(index, condition, posX, posY, posZ, strength) // whirlpool spawner
+PUSH_POOL() / POP_POOL()     // nested memory pool checkpoints
+CALL(arg, func)              // call a C function once
+CALL_LOOP(arg, func)         // call a C function every frame until nonzero
+```
+
+## Level organization
+
+Each level lives under `levels/<shortname>/` and contains at minimum:
+
+| File | Purpose |
+|---|---|
+| `script.c` | The `LevelScript` array(s) — loading order, areas, warps |
+| `geo.c` | Includes all `geo.inc.c` files for the level's areas and actors |
+| `leveldata.c` | Collision meshes, display lists, macro object tables |
+| `header.h` | Extern declarations for all geo layouts and data symbols |
+
+## Real example: Bob-omb Battlefield (`levels/bob/script.c`)
+
+```c
+const LevelScript level_bob_entry[] = {
+    INIT_LEVEL(),
+    LOAD_MIO0        (/*seg*/ 0x07, _bob_segment_7SegmentRomStart, _bob_segment_7SegmentRomEnd),
+    LOAD_MIO0_TEXTURE(/*seg*/ 0x09, _generic_mio0SegmentRomStart,  _generic_mio0SegmentRomEnd),
+    LOAD_MIO0        (/*seg*/ 0x0A, _water_skybox_mio0SegmentRomStart, _water_skybox_mio0SegmentRomEnd),
+    LOAD_MIO0        (/*seg*/ 0x05, _group3_mio0SegmentRomStart,   _group3_mio0SegmentRomEnd),
+    LOAD_RAW         (/*seg*/ 0x0C, _group3_geoSegmentRomStart,    _group3_geoSegmentRomEnd),
+    LOAD_MIO0        (/*seg*/ 0x06, _group14_mio0SegmentRomStart,  _group14_mio0SegmentRomEnd),
+    LOAD_RAW         (/*seg*/ 0x0D, _group14_geoSegmentRomStart,   _group14_geoSegmentRomEnd),
+    LOAD_MIO0        (/*seg*/ 0x08, _common0_mio0SegmentRomStart,  _common0_mio0SegmentRomEnd),
+    LOAD_RAW         (/*seg*/ 0x0F, _common0_geoSegmentRomStart,   _common0_geoSegmentRomEnd),
+    ALLOC_LEVEL_POOL(),
+    MARIO(/*model*/ MODEL_MARIO, /*bhvParam*/ BPARAM4(0x01), /*bhv*/ bhvMario),
+    JUMP_LINK(script_func_global_1),   // common actors group 1
+    JUMP_LINK(script_func_global_4),   // common actors group 4
+    JUMP_LINK(script_func_global_15),  // common actors group 15
+    LOAD_MODEL_FROM_GEO(MODEL_BOB_BUBBLY_TREE,      bubbly_tree_geo),
+    LOAD_MODEL_FROM_GEO(MODEL_BOB_CHAIN_CHOMP_GATE, bob_geo_000440),
+    LOAD_MODEL_FROM_GEO(MODEL_BOB_SEESAW_PLATFORM,  bob_geo_000458),
+    LOAD_MODEL_FROM_GEO(MODEL_BOB_BARS_GRILLS,      bob_geo_000470),
+
+    AREA(/*index*/ 1, bob_geo_000488),
+        JUMP_LINK(script_func_local_1),  // static set-pieces
+        JUMP_LINK(script_func_local_2),  // enemies and act-specific objects
+        JUMP_LINK(script_func_local_3),  // stars
+        // Warp objects (invisible — handled by behavior scripts)
+        OBJECT(/*model*/ MODEL_NONE, /*pos*/ -6558, 1000,  6464, /*angle*/ 0,  135,    0, BPARAM2(WARP_NODE_0A), bhvSpinAirborneWarp),
+        OBJECT(/*model*/ MODEL_NONE, /*pos*/   583, 2683, -5387, /*angle*/ 0, -154,    0, BPARAM2(WARP_NODE_0B), bhvFadingWarp),
+        // … more warp objects …
+        WARP_NODE(WARP_NODE_0A,      LEVEL_BOB,    1, WARP_NODE_0A, WARP_NO_CHECKPOINT),
+        WARP_NODE(WARP_NODE_0B,      LEVEL_BOB,    1, WARP_NODE_0C, WARP_NO_CHECKPOINT),
+        WARP_NODE(WARP_NODE_0C,      LEVEL_BOB,    1, WARP_NODE_0B, WARP_NO_CHECKPOINT),
+        WARP_NODE(WARP_NODE_SUCCESS, LEVEL_CASTLE, 1, WARP_NODE_32, WARP_NO_CHECKPOINT),
+        WARP_NODE(WARP_NODE_DEATH,   LEVEL_CASTLE, 1, WARP_NODE_64, WARP_NO_CHECKPOINT),
+        TERRAIN(bob_seg7_collision_level),
+        MACRO_OBJECTS(bob_seg7_macro_objs),
+        SHOW_DIALOG(0x00, DIALOG_000),
+        SET_BACKGROUND_MUSIC(0x0000, SEQ_LEVEL_GRASS),
+        TERRAIN_TYPE(TERRAIN_GRASS),
+    END_AREA(),
+
+    FREE_LEVEL_POOL(),
+    MARIO_POS(/*area*/ 1, /*yaw*/ 135, /*pos*/ -6558, 0, 6464),
+    CALL(/*arg*/ 0, /*func*/ lvl_init_or_update),
+    CALL_LOOP(/*arg*/ 1, /*func*/ lvl_init_or_update),
+    CLEAR_LEVEL(),
+    SLEEP_BEFORE_EXIT(/*frames*/ 1),
+    EXIT(),
+};
+```
+
+### Loading sequence walkthrough
+
+<Steps>
+  <Step title="Segment loads">
+    `LOAD_MIO0` and `LOAD_RAW` stream data from ROM into N64 RAM segments. MIO0 data is decompressed on the fly; RAW data is a straight DMA copy. Each segment number is a 4-bit key into the CPU's segment table.
+  </Step>
+  <Step title="Pool and Mario">
+    `ALLOC_LEVEL_POOL()` carves out the level heap. `MARIO(...)` spawns the Mario object with its behavior and model.
+  </Step>
+  <Step title="Global actor groups">
+    `JUMP_LINK(script_func_global_N)` calls shared scripts that load commonly used actors (goombas, coins, Bob-ombs) via `LOAD_MODEL_FROM_GEO` from segment 0x0C / 0x0D.
+  </Step>
+  <Step title="Level-specific models">
+    `LOAD_MODEL_FROM_GEO` calls for models unique to BoB (trees, the gate, the seesaw) fill remaining model slots.
+  </Step>
+  <Step title="Area block">
+    `AREA(1, bob_geo_000488)` passes the area's root geo layout to the interpreter, which calls `process_geo_layout()` to build the scene graph. Everything inside the block (objects, terrain, warps) is scoped to area 1.
+  </Step>
+  <Step title="Subroutines for object groups">
+    `JUMP_LINK(script_func_local_N)` calls local script arrays that contain dense batches of `OBJECT` / `OBJECT_WITH_ACTS` commands, keeping the main entry array readable.
+  </Step>
+  <Step title="Warp graph">
+    `WARP_NODE` entries define a directed graph of teleport destinations. Each warp object in the world carries a `WARP_NODE_*` ID; when Mario touches it, the engine looks up that ID in the area's warp table to find `destLevel`, `destArea`, and `destNode`.
+  </Step>
+  <Step title="Terrain and audio">
+    `TERRAIN` uploads the collision mesh, `MACRO_OBJECTS` spawns small objects in bulk, and `SET_BACKGROUND_MUSIC` queues the level's music sequence.
+  </Step>
+  <Step title="Game loop handoff">
+    `CALL_LOOP(1, lvl_init_or_update)` runs every frame until it returns nonzero. Afterwards, `CLEAR_LEVEL()` and `EXIT()` handle the teardown path.
+  </Step>
+</Steps>
+
+## The warp system
+
+<Note>
+Warp nodes form a directed graph, not a map. `WARP_NODE_0B` in BoB sends Mario to `WARP_NODE_0C`, and `WARP_NODE_0C` sends him back to `WARP_NODE_0B` — the two-way shortcut between mountain base and summit.
+</Note>
+
+Each `WARP_NODE` command records:
+
+| Field | Description |
+|---|---|
+| `id` | Source warp ID (matches the bhvParam of a warp object) |
+| `destLevel` | Target level number |
+| `destArea` | Target area index within that level |
+| `destNode` | ID of the warp node to spawn Mario at in the destination |
+| `flags` | `WARP_CHECKPOINT` saves a checkpoint; `WARP_NO_CHECKPOINT` does not |
+
+The reserved IDs `WARP_NODE_SUCCESS` and `WARP_NODE_DEATH` are always present and route Mario back to the castle after collecting a star or dying.
+
+`PAINTING_WARP_NODE` works identically but signals the engine to play the painting warp-in animation. `INSTANT_WARP` teleports Mario within the same level with a position displacement (used for the Tiny-Huge Island size transition).
+
+## The global level list
+
+The file `levels/scripts.c` contains the top-level entry script that all levels ultimately branch from. It is a sequence of `JUMP_LINK_IF` / `EXIT_AND_EXECUTE` commands that selects the appropriate `level_*_entry` array based on `VAR_CURR_LEVEL_NUM`:
+
+```c
+// Conceptual structure of levels/scripts.c
+JUMP_LINK_IF(OP_EQ, LEVEL_BOB,     level_bob_entry)
+JUMP_LINK_IF(OP_EQ, LEVEL_WF,      level_wf_entry)
+// … all other levels …
+```
+
+`level_script_entry` (declared in `level_script.h` and defined in `levels/scripts.c`) is the very first array executed when the game boots.
+
+<Tip>
+When adding a new level, you must add its entry array to `levels/scripts.c` and assign it a level number in `level_table.h`. The level script interpreter will find it automatically from there.
+</Tip>
+
+## Multi-area levels
+
+Levels like Shifting Sand Land (3 areas: outside, pyramid interior, Eyerok boss) define multiple `AREA` / `END_AREA` blocks, each with its own geo layout and object list. The engine loads only the active area's geo and collision; switching areas calls `CLEAR_LEVEL()` on the old area and re-runs the relevant portion of the level script.

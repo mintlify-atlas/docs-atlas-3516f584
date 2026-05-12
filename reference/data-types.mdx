@@ -1,0 +1,333 @@
+---
+title: "Data types and math utilities in SM64 source"
+description: "Primitive types, vector and matrix types, script aliases, animation structs, angle representation, and math utility functions used throughout the SM64 codebase."
+---
+
+The SM64 decompilation relies on a carefully structured set of type definitions found primarily in `include/types.h`. Understanding these types is essential before reading or writing any behavior or engine code. This page covers primitive integer and float types, the vector and matrix types used for 3D math, the script-data aliases for collision and behavior arrays, the animation structs, and the math helper functions declared in `src/engine/math_util.h`.
+
+## Primitive types
+
+SM64 uses the N64 SDK's `ultra64.h` integer types throughout the codebase. All types below are guaranteed-width aliases.
+
+| Type | Underlying type | Size | Notes |
+|------|----------------|------|-------|
+| `u8`  | `unsigned char`  | 1 byte  | Unsigned 8-bit |
+| `s8`  | `signed char`    | 1 byte  | Signed 8-bit |
+| `u16` | `unsigned short` | 2 bytes | Unsigned 16-bit |
+| `s16` | `signed short`   | 2 bytes | Signed 16-bit; also used for angles |
+| `u32` | `unsigned int`   | 4 bytes | Unsigned 32-bit |
+| `s32` | `signed int`     | 4 bytes | Signed 32-bit |
+| `f32` | `float`          | 4 bytes | 32-bit IEEE 754 float |
+
+## Vector types
+
+All vector types are plain C arrays, not structs. **Y is the up-axis** in SM64's coordinate system.
+
+<ResponseField name="Vec2f" type="f32[2]">
+  Two-component float vector. Used for 2D texture coordinates and some UV mapping.
+</ResponseField>
+
+<ResponseField name="Vec3f" type="f32[3]">
+  Three-component float vector (`[X, Y, Z]`, Y is up). The primary type for world-space positions, velocities, and surface normals.
+
+  ```c
+  typedef f32 Vec3f[3]; // X, Y, Z, where Y is up
+  ```
+</ResponseField>
+
+<ResponseField name="Vec3s" type="s16[3]">
+  Three-component signed 16-bit integer vector. Used for compact angle storage (`faceAngle`, `angle` in `GraphNodeObject`) and for collision vertex coordinates.
+</ResponseField>
+
+<ResponseField name="Vec3i" type="s32[3]">
+  Three-component signed 32-bit integer vector. Used where higher-precision integer coordinates are needed.
+</ResponseField>
+
+<ResponseField name="Vec4f" type="f32[4]">
+  Four-component float vector. Used internally by the spline weight system (`spline_get_weights`).
+</ResponseField>
+
+<ResponseField name="Vec4s" type="s16[4]">
+  Four-component signed 16-bit integer vector. Used as the keyframe type for animation splines (`anim_spline_init`).
+</ResponseField>
+
+## Matrix type
+
+<ResponseField name="Mat4" type="f32[4][4]">
+  A 4×4 row-major float matrix. Used for all object and camera transforms.
+
+  ```c
+  typedef f32 Mat4[4][4];
+  ```
+
+  The engine stores a `Mat4 transform` directly inside `struct Object` (at offset `0x21C`) and a pointer `Mat4 *throwMatrix` in `GraphNodeObject` for held-object rendering.
+</ResponseField>
+
+## Script and data type aliases
+
+These aliases are all thin `typedef`s over integer primitives. They communicate intent to the reader rather than adding any runtime behaviour.
+
+<ResponseField name="GeoLayout" type="uintptr_t">
+  An element of a geometry layout (display list command) array. Defined as `uintptr_t` to hold either an integer command word or a pointer on both 32-bit and 64-bit hosts.
+</ResponseField>
+
+<ResponseField name="LevelScript" type="uintptr_t">
+  An element of a level script command array. Same representation as `GeoLayout`.
+</ResponseField>
+
+<ResponseField name="BehaviorScript" type="uintptr_t">
+  An element of an object behavior script array.
+</ResponseField>
+
+<ResponseField name="Movtex" type="s16">
+  An element in a moving-texture vertex array.
+</ResponseField>
+
+<ResponseField name="MacroObject" type="s16">
+  An element in a macro-object placement array (used in level scripts to place objects cheaply).
+</ResponseField>
+
+<ResponseField name="Collision" type="s16">
+  An element in a raw collision data array. Values are limited to **−32768 … 32767**. If you need coordinates outside that range, change the typedef to `s32` (and update `TerrainData` / `Vec3Terrain` accordingly).
+
+  ```c
+  typedef s16 Collision; // Collision data is limited to -32768 to 32767.
+  ```
+</ResponseField>
+
+<ResponseField name="Trajectory" type="s16">
+  An element in an object trajectory (waypoint path) array.
+</ResponseField>
+
+<ResponseField name="PaintingData" type="s16">
+  An element in a painting geometry/animation data array.
+</ResponseField>
+
+<ResponseField name="Texture" type="u8">
+  A single byte of raw texture data.
+</ResponseField>
+
+<ResponseField name="RoomData" type="s8">
+  A room index. Limited to **−128 … 127** (256 rooms total). Change to `s16` if more rooms are required.
+</ResponseField>
+
+<ResponseField name="TerrainData" type="Collision (s16)">
+  Alias for `Collision`; used in surface/collision structs (`struct Surface`) to make the purpose of a field obvious.
+</ResponseField>
+
+## Animation types
+
+### ANIM_FLAG_* constants
+
+Animation behaviour is controlled by a bitmask stored in `Animation.flags`.
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `ANIM_FLAG_NOLOOP`     | `0x01` | Play once; do not loop |
+| `ANIM_FLAG_BACKWARD`   | `0x02` | Play in reverse |
+| `ANIM_FLAG_2`          | `0x04` | (purpose unknown) |
+| `ANIM_FLAG_HOR_TRANS`  | `0x08` | Apply horizontal root translation from animation data |
+| `ANIM_FLAG_VERT_TRANS` | `0x10` | Apply vertical root translation from animation data |
+| `ANIM_FLAG_5`          | `0x20` | (purpose unknown) |
+| `ANIM_FLAG_6`          | `0x40` | (purpose unknown) |
+| `ANIM_FLAG_7`          | `0x80` | (purpose unknown) |
+
+### struct Animation
+
+Defined in `include/types.h`.
+
+```c
+struct Animation {
+    /*0x00*/ s16 flags;             // ANIM_FLAG_* bitmask
+    /*0x02*/ s16 animYTransDivisor; // divisor for vertical root translation
+    /*0x04*/ s16 startFrame;        // first frame index
+    /*0x06*/ s16 loopStart;         // loop-back frame
+    /*0x08*/ s16 loopEnd;           // last frame before loop
+    /*0x0A*/ s16 unusedBoneCount;
+    /*0x0C*/ const s16 *values;     // flat array of rotation/translation values
+    /*0x10*/ const u16 *index;      // index table mapping bones to value runs
+    /*0x14*/ u32 length;            // bytes to DMA for Mario anims; 0 otherwise
+};
+```
+
+<ResponseField name="flags" type="s16">
+  Bitmask of `ANIM_FLAG_*` constants controlling loop and translation behaviour.
+</ResponseField>
+
+<ResponseField name="animYTransDivisor" type="s16">
+  Vertical translation values from the `values` array are divided by this to produce world-unit offsets.
+</ResponseField>
+
+<ResponseField name="startFrame / loopStart / loopEnd" type="s16">
+  Frame range. When the animation reaches `loopEnd`, it jumps back to `loopStart` (unless `ANIM_FLAG_NOLOOP` is set, in which case it holds on the last frame).
+</ResponseField>
+
+<ResponseField name="values / index" type="const s16* / const u16*">
+  Packed rotation data. The `index` table stores run-length entries per bone; `values` stores the actual angle deltas. Use `ANIMINDEX_NUMPARTS(animindex)` to compute the bone count from the index table.
+</ResponseField>
+
+### struct AnimInfo
+
+Tracks the runtime playback state of an animation on an object's `GraphNodeObject`.
+
+```c
+struct AnimInfo {
+    /*0x00*/ s16 animID;
+    /*0x02*/ s16 animYTrans;           // current vertical root offset
+    /*0x04*/ struct Animation *curAnim;
+    /*0x08*/ s16 animFrame;
+    /*0x0A*/ u16 animTimer;
+    /*0x0C*/ s32 animFrameAccelAssist; // sub-frame accumulator for variable-speed anims
+    /*0x10*/ s32 animAccel;            // playback speed multiplier (0 = normal)
+};
+```
+
+## Angle representation
+
+<Note>
+  SM64 uses **binary angle measurement** (BAM) throughout the engine. All angles are stored as `s16` values where the full circle is 0–65535 (unsigned), mapping exactly to 0°–360°.
+</Note>
+
+The engine never works with degrees or radians directly. Instead it indexes look-up tables:
+
+```c
+extern f32 gSineTable[];   // 4096-entry sine table
+// gCosineTable overlaps gSineTable at offset 0x400
+
+#define sins(x) gSineTable[(u16)(x) >> 4]   // sine of a binary angle
+#define coss(x) gCosineTable[(u16)(x) >> 4] // cosine of a binary angle
+```
+
+The `>> 4` shift converts a 16-bit binary angle into a 12-bit table index (4096 entries covering one full circle). To convert from conventional degrees:
+
+```c
+s16 angle = (s16)((degrees / 360.0f) * 65536.0f);
+```
+
+`Vec3s` is used for angle triples (pitch, yaw, roll) in both `GraphNodeObject.angle` and `MarioState.faceAngle`. Object fields `oFaceAnglePitch`, `oFaceAngleYaw`, `oFaceAngleRoll` and `oMoveAnglePitch`, `oMoveAngleYaw`, `oMoveAngleRoll` store the same representation as `s32` (sign-extended from s16).
+
+## Math utility functions
+
+All functions below are declared in `src/engine/math_util.h` and implemented in `src/engine/math_util.c`.
+
+### Vec3f operations
+
+<ResponseField name="vec3f_copy(dest, src)" type="void *">
+  Copies `src` into `dest`. Both must be `Vec3f`.
+</ResponseField>
+
+<ResponseField name="vec3f_set(dest, x, y, z)" type="void *">
+  Sets all three components of `dest`.
+</ResponseField>
+
+<ResponseField name="vec3f_add(dest, a)" type="void *">
+  In-place addition: `dest += a`.
+</ResponseField>
+
+<ResponseField name="vec3f_sum(dest, a, b)" type="void *">
+  `dest = a + b`.
+</ResponseField>
+
+<ResponseField name="vec3f_cross(dest, a, b)" type="void *">
+  Computes the cross product: `dest = a × b`.
+</ResponseField>
+
+<ResponseField name="vec3f_normalize(dest)" type="void *">
+  Normalises `dest` in-place to unit length.
+</ResponseField>
+
+<ResponseField name="find_vector_perpendicular_to_plane(dest, a, b, c)" type="void *">
+  Computes the normal of the plane defined by triangle vertices `a`, `b`, `c` and stores it in `dest`.
+</ResponseField>
+
+### Vec3s operations
+
+```c
+void *vec3s_copy(Vec3s dest, Vec3s src);
+void *vec3s_set(Vec3s dest, s16 x, s16 y, s16 z);
+void *vec3s_add(Vec3s dest, Vec3s a);
+void *vec3s_sum(Vec3s dest, Vec3s a, Vec3s b);
+void *vec3s_sub(Vec3s dest, Vec3s a);
+void *vec3s_to_vec3f(Vec3f dest, Vec3s a);
+void *vec3f_to_vec3s(Vec3s dest, Vec3f a);
+```
+
+The `vec3s_to_vec3f` / `vec3f_to_vec3s` pair converts between the compact angle representation and floating-point for rendering.
+
+### Matrix operations
+
+<ResponseField name="mtxf_identity(mtx)" type="void">
+  Loads the 4×4 identity matrix into `mtx`.
+</ResponseField>
+
+<ResponseField name="mtxf_copy(dest, src)" type="void">
+  Copies a `Mat4`.
+</ResponseField>
+
+<ResponseField name="mtxf_translate(dest, b)" type="void">
+  Creates a pure translation matrix from the vector `b`.
+</ResponseField>
+
+<ResponseField name="mtxf_rotate_zxy_and_translate(dest, translate, rotate)" type="void">
+  Builds a combined rotate-then-translate matrix. Rotation order is Z→X→Y (pitch/roll/yaw), which matches the standard object orientation convention used by most behaviors.
+</ResponseField>
+
+<ResponseField name="mtxf_rotate_xyz_and_translate(dest, b, c)" type="void">
+  Same as above but with X→Y→Z rotation order. Used for the camera and a few other nodes.
+</ResponseField>
+
+<ResponseField name="mtxf_lookat(mtx, from, to, roll)" type="void">
+  Computes a look-at matrix (camera facing `to` from `from`) with an optional `roll` angle.
+</ResponseField>
+
+<ResponseField name="mtxf_billboard(dest, mtx, position, angle)" type="void">
+  Builds a billboard matrix so a quad always faces the camera. Used for particles.
+</ResponseField>
+
+<ResponseField name="mtxf_align_terrain_normal(dest, upDir, pos, yaw)" type="void">
+  Aligns an object's matrix to the surface normal `upDir`, useful for objects that rest on slopes.
+</ResponseField>
+
+<ResponseField name="mtxf_mul(dest, a, b)" type="void">
+  Matrix multiplication: `dest = a × b`.
+</ResponseField>
+
+<ResponseField name="mtxf_scale_vec3f(dest, mtx, s)" type="void">
+  Applies a non-uniform scale `s` to `mtx` and stores the result in `dest`.
+</ResponseField>
+
+<ResponseField name="mtxf_to_mtx(dest, src)" type="void">
+  Converts a `Mat4` (f32) into the N64 fixed-point `Mtx` format required by the RSP microcode.
+</ResponseField>
+
+### Polar / angular utilities
+
+<ResponseField name="vec3f_get_dist_and_angle(from, to, dist, pitch, yaw)" type="void">
+  Decomposes the vector `to − from` into a distance and two binary angles. This is the canonical way to compute facing angles toward a target.
+</ResponseField>
+
+<ResponseField name="vec3f_set_dist_and_angle(from, to, dist, pitch, yaw)" type="void">
+  Inverse of the above: writes the point that is `dist` away from `from` in the direction `(pitch, yaw)` into `to`.
+</ResponseField>
+
+<ResponseField name="atan2s(y, x)" type="s16">
+  Returns a binary-angle arctangent of `y/x`, analogous to `atan2` from `<math.h>` but returning an `s16` BAM angle.
+</ResponseField>
+
+<ResponseField name="approach_s32(current, target, inc, dec)" type="s32">
+  Moves `current` toward `target` by at most `inc` if increasing or `dec` if decreasing. Clamps at `target`. Used to smoothly interpolate integer values each frame.
+</ResponseField>
+
+<ResponseField name="approach_f32(current, target, inc, dec)" type="f32">
+  Float version of `approach_s32`.
+</ResponseField>
+
+### Scalar helpers
+
+```c
+#define min(a, b) ((a) <= (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define sqr(x)    ((x) * (x))
+```
+
+These macros are defined at the top of `math_util.h` and are safe to use with any numeric type.

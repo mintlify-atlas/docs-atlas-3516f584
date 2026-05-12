@@ -1,0 +1,393 @@
+---
+title: "Surface collision: floors, walls, and ceilings"
+description: "SM64 collision internals: the Surface struct, spatial partition grid, and the floor, ceiling, and wall query functions called on every movement step."
+---
+
+SM64's collision system is built around individual triangles called **surfaces**. Every floor, wall, ceiling, and special trigger in a level is one or more `Surface` triangles. Each frame, Mario's movement step functions query a spatial grid of these triangles to detect floors below, ceilings above, and walls to the side, then apply the appropriate response.
+
+The system lives in `src/engine/surface_collision.c` and `src/engine/surface_load.c`. Surface type constants are in `include/surface_terrains.h`.
+
+---
+
+## The Surface struct
+
+```c
+// include/types.h — offset annotations are byte offsets from struct start
+struct Surface {
+    /*0x00*/ TerrainData type;       // surface type (SURFACE_DEFAULT, SURFACE_ICE, etc.)
+    /*0x02*/ TerrainData force;      // parameter used by special surfaces (wind direction, etc.)
+    /*0x04*/ s8 flags;               // SURFACE_FLAG_* bitmask
+    /*0x05*/ RoomData room;          // room index for BBH-style room management (-128 to 127)
+    /*0x06*/ TerrainData lowerY;     // minimum Y extent for fast wall rejection
+    /*0x08*/ TerrainData upperY;     // maximum Y extent for fast wall rejection
+    /*0x0A*/ Vec3Terrain vertex1;    // first triangle vertex  {x, y, z} as s16
+    /*0x10*/ Vec3Terrain vertex2;    // second triangle vertex
+    /*0x16*/ Vec3Terrain vertex3;    // third triangle vertex
+    /*0x1C*/ struct {
+        f32 x;
+        f32 y;
+        f32 z;
+    } normal;                        // precomputed unit normal vector
+    /*0x28*/ f32 originOffset;       // plane equation constant: dot(normal, vertex1)
+    /*0x2C*/ struct Object *object;  // owning object for dynamic surfaces, NULL for static
+};
+```
+
+`TerrainData` is `s16` (same as `Collision`). `Vec3Terrain` is `s16[3]`, a compact integer triplet. All vertex coordinates are in game units (integers, not floats) because the original N64 level format stored them as 16-bit integers.
+
+<ResponseField name="type" type="TerrainData (s16) @ 0x00">
+  Identifies what kind of surface this is. The collision system and gameplay code branch on this value to apply special behavior. See **Surface types** below.
+</ResponseField>
+
+<ResponseField name="force" type="TerrainData (s16) @ 0x02">
+  An optional parameter stored alongside the type. For `SURFACE_FLOWING_WATER` it encodes the flow direction; for `SURFACE_HORIZONTAL_WIND` it encodes the wind direction (shifted left by 8 bits when spawning wind particles). Zero for most surfaces.
+</ResponseField>
+
+<ResponseField name="flags" type="s8 @ 0x04">
+  Bitmask of per-triangle flags:
+
+  | Constant | Value | Meaning |
+  |---|---|---|
+  | `SURFACE_FLAG_DYNAMIC` | `1 << 0` | Surface belongs to a moving object; lives in `gDynamicSurfacePartition` |
+  | `SURFACE_FLAG_NO_CAM_COLLISION` | `1 << 1` | Camera passes through this surface |
+  | `SURFACE_FLAG_X_PROJECTION` | `1 << 3` | Wall uses X-axis projection for point-in-triangle test instead of Z-axis |
+</ResponseField>
+
+<ResponseField name="room" type="RoomData (s8) @ 0x05">
+  Used in Big Boo's Haunt to partition the level into rooms and prevent collision leaking between disconnected spaces. 0 in most levels.
+</ResponseField>
+
+<ResponseField name="lowerY / upperY" type="TerrainData (s16) @ 0x06 / 0x08">
+  Pre-computed Y-range of the triangle (min/max of the three vertex Y values). The wall collision iterator uses these for a fast early-out: if the query point's Y is below `lowerY` or above `upperY`, the triangle is skipped immediately without a full point-in-triangle test.
+</ResponseField>
+
+<ResponseField name="vertex1 / vertex2 / vertex3" type="Vec3Terrain (s16[3]) @ 0x0A / 0x10 / 0x16">
+  The three corner vertices of the triangle in world space. Stored as signed 16-bit integers. Floor and ceiling tests use vertex X and Z components; wall tests also use Y.
+</ResponseField>
+
+<ResponseField name="normal" type="struct { f32 x, y, z; } @ 0x1C">
+  Precomputed unit normal vector. For floors, `normal.y > 0`; for ceilings, `normal.y < 0`; for walls, `normal.y ≈ 0`. Used in the plane equation to compute the surface height at any XZ position.
+</ResponseField>
+
+<ResponseField name="originOffset" type="f32 @ 0x28">
+  The constant term in the plane equation: `normal · vertex1`. Together with `normal`, this defines the plane the triangle lies in. Height at `(x, z)` is computed as:
+
+  ```c
+  height = -(x * normal.x + z * normal.z + originOffset) / normal.y;
+  ```
+</ResponseField>
+
+<ResponseField name="object" type="struct Object * @ 0x2C">
+  For surfaces loaded from a moving object (`load_object_collision_model()`), this points to the owning object. `NULL` for static level geometry. Allows gameplay code to identify the object associated with a surface (e.g. to check if Mario is standing on a platform object).
+</ResponseField>
+
+---
+
+## Spatial partition
+
+The level world spans `[-8192, +8192]` in X and Z (`LEVEL_BOUNDARY_MAX = 0x2000`). This 16384×16384 unit area is divided into a **16×16 grid** of cells, each `1024` units wide (`CELL_SIZE = 1 << 10`).
+
+```c
+// src/engine/surface_load.h
+#define NUM_CELLS       (2 * LEVEL_BOUNDARY_MAX / CELL_SIZE)  // 32... actually 16 in practice
+#define NUM_CELLS_INDEX (NUM_CELLS - 1)
+
+typedef struct SurfaceNode SpatialPartitionCell[3]; // [floors, ceilings, walls]
+
+extern SpatialPartitionCell gStaticSurfacePartition[NUM_CELLS][NUM_CELLS];
+extern SpatialPartitionCell gDynamicSurfacePartition[NUM_CELLS][NUM_CELLS];
+```
+
+Each cell holds three **linked lists** of `SurfaceNode` pointers (floors, ceilings, walls), one for static geometry and one for dynamic (object) surfaces. Any triangle that spans multiple cells is added to every cell it touches.
+
+```c
+struct SurfaceNode {
+    struct SurfaceNode *next;
+    struct Surface *surface;
+};
+```
+
+Collision queries find the relevant cell from the query position, then walk only the linked list for that cell, ignoring the rest of the level entirely. This keeps per-frame collision cost proportional to the local surface density rather than the total level size.
+
+<Note>
+  Dynamic surfaces are rebuilt every frame by `clear_dynamic_surfaces()` followed by each object's `load_object_collision_model()` call. Static surfaces are loaded once at level start by `load_area_terrain()` and persist until the level changes.
+</Note>
+
+---
+
+## Three detection types
+
+### Floors
+
+**Floor** detection finds the highest surface below a point whose normal has a nonzero Y component and whose plane equation puts the query point above the surface (within a 78-unit snapping buffer).
+
+The core test from `find_floor_from_list()` (`surface_collision.c:401`):
+
+```c
+// Point-in-triangle test (XZ plane)
+if ((z1 - z) * (x2 - x1) - (x1 - x) * (z2 - z1) < 0) continue;
+if ((z2 - z) * (x3 - x2) - (x2 - x) * (z3 - z2) < 0) continue;
+if ((z3 - z) * (x1 - x3) - (x3 - x) * (z1 - z3) < 0) continue;
+
+// Height at the query point
+height = -(x * nx + nz * z + oo) / ny;
+
+// 78-unit buffer: must be standing on or within 78 units above the surface
+if (y - (height + -78.0f) < 0.0f) continue;
+```
+
+The 78-unit buffer prevents Mario from falling through thin floors when his speed exceeds one triangle thickness per frame.
+
+### Ceilings
+
+**Ceiling** detection is the vertical mirror of floor detection. The point-in-triangle test is identical but the winding is opposite (ceilings face downward, `normal.y < 0`). The buffer is `+78` instead of `-78`:
+
+```c
+// surface_collision.c:288
+if (y - (height - -78.0f) > 0.0f) continue; // equivalent to y > height + 78
+```
+
+The first ceiling found (not necessarily the lowest) is returned due to a known quirk: [Surface Cucking] — a lower ceiling can be "cucked" by a higher one that appears first in the linked list.
+
+### Walls
+
+**Wall** detection uses a different algorithm. Instead of computing height, it computes the signed distance from the query point to the triangle's plane and applies a **push** if the point is within the collision radius:
+
+```c
+// surface_collision.c:47
+offset = surf->normal.x * x + surf->normal.y * y + surf->normal.z * z + surf->originOffset;
+
+if (offset < -radius || offset > radius) continue;
+
+// Push the position out by (radius - offset)
+data->x += surf->normal.x * (radius - offset);
+data->z += surf->normal.z * (radius - offset);
+```
+
+The maximum collision radius is clamped to 200 units. Up to 4 walls can be accumulated in `WallCollisionData.walls[]`; beyond that, additional walls are counted but not stored (the "Unreferenced Walls" bug).
+
+---
+
+## Key query functions
+
+All declared in `src/engine/surface_collision.h`:
+
+<ResponseField name="find_floor(xPos, yPos, zPos, &pfloor)" type="f32">
+  Returns the Y height of the highest floor surface below `(xPos, yPos, zPos)` and writes the `Surface *` to `*pfloor`. Returns `FLOOR_LOWER_LIMIT` (`-11000`) and sets `*pfloor = NULL` if no floor is found.
+
+  ```c
+  f32 find_floor(f32 xPos, f32 yPos, f32 zPos, struct Surface **pfloor);
+  ```
+
+  Checks dynamic surfaces first, then static, and returns whichever is higher. Used by `init_mario()`, every movement step function, and many object behaviors.
+
+  ```c
+  // Typical usage (from init_mario, mario.c:1832)
+  gMarioState->floorHeight =
+      find_floor(gMarioState->pos[0], gMarioState->pos[1], gMarioState->pos[2],
+                 &gMarioState->floor);
+  ```
+</ResponseField>
+
+<ResponseField name="find_ceil(posX, posY, posZ, &pceil)" type="f32">
+  Returns the Y height of the lowest ceiling above `(posX, posY, posZ)` and writes the `Surface *` to `*pceil`. Returns `CELL_HEIGHT_LIMIT` (`20000`) and sets `*pceil = NULL` if no ceiling exists.
+
+  ```c
+  f32 find_ceil(f32 posX, f32 posY, f32 posZ, struct Surface **pceil);
+  ```
+
+  Internally casts position to `s16` before the grid lookup, which is the root cause of the **Parallel Universes** (PU) glitch: at high float positions the cast wraps around and queries a completely different grid cell.
+</ResponseField>
+
+<ResponseField name="find_wall_collisions(colData)" type="s32">
+  Populates a `WallCollisionData` struct with all wall surfaces within the specified radius of the given position. Returns the total number of collisions found. The struct also has its `x` and `z` fields modified to reflect the pushed-out position.
+
+  ```c
+  s32 find_wall_collisions(struct WallCollisionData *colData);
+
+  struct WallCollisionData {
+      f32 x, y, z;     // query position (x and z modified by push)
+      f32 offsetY;      // vertical offset applied to y before querying
+      f32 radius;       // collision radius (clamped to 200.0f internally)
+      u8 filler[2];
+      s16 numWalls;     // number of walls found (up to 4 stored)
+      struct Surface *walls[4]; // up to 4 wall surface pointers
+  };
+  ```
+</ResponseField>
+
+<ResponseField name="f32_find_wall_collision(xPtr, yPtr, zPtr, offsetY, radius)" type="s32">
+  Convenience wrapper around `find_wall_collisions()` that takes direct float pointers instead of a `WallCollisionData` struct and writes the pushed position back to the pointer arguments.
+
+  ```c
+  s32 f32_find_wall_collision(f32 *xPtr, f32 *yPtr, f32 *zPtr, f32 offsetY, f32 radius);
+  ```
+</ResponseField>
+
+<ResponseField name="resolve_and_return_wall_collisions(pos, offset, radius)" type="struct Surface *">
+  Declared in `src/game/mario.h`, implemented in `src/game/mario.c`. Calls `find_wall_collisions()` and applies the resulting position push back to `pos`. Returns the first wall surface encountered, or `NULL`.
+
+  ```c
+  struct Surface *resolve_and_return_wall_collisions(Vec3f pos, f32 offset, f32 radius);
+  ```
+</ResponseField>
+
+<ResponseField name="vec3f_find_ceil(pos, height, &ceil)" type="f32">
+  Variant of `find_ceil()` that takes a `Vec3f` position and an explicit height offset for the query. Declared in `src/game/mario.h`.
+
+  ```c
+  f32 vec3f_find_ceil(Vec3f pos, f32 height, struct Surface **ceil);
+  ```
+</ResponseField>
+
+<ResponseField name="find_floor_height_and_data(x, y, z, &floorGeo)" type="f32">
+  Like `find_floor()` but also populates a `FloorGeometry` struct with the floor's normal components and `originOffset`. Used by the shadow system and slope calculations.
+
+  ```c
+  f32 find_floor_height_and_data(f32 xPos, f32 yPos, f32 zPos, struct FloorGeometry **floorGeo);
+
+  struct FloorGeometry {
+      u8 filler[16];
+      f32 normalX;
+      f32 normalY;
+      f32 normalZ;
+      f32 originOffset;
+  };
+  ```
+</ResponseField>
+
+<ResponseField name="find_water_level(x, z)" type="f32">
+  Finds the water surface height at a given XZ coordinate by scanning environment waterbox data embedded in the level collision. Returns `-11000` if no waterbox covers the point.
+</ResponseField>
+
+---
+
+## Surface types
+
+`include/surface_terrains.h` defines every surface type value. Selected important ones:
+
+<Accordion title="Gameplay-affecting floor types">
+| Constant | Value | Effect |
+|---|---|---|
+| `SURFACE_DEFAULT` | `0x0000` | Standard floor, no special behavior |
+| `SURFACE_BURNING` | `0x0001` | Lava/frostbite; damages Mario on contact |
+| `SURFACE_DEATH_PLANE` | `0x000A` | Instant death floor |
+| `SURFACE_VERY_SLIPPERY` | `0x0013` | High-friction slide surface (slides) |
+| `SURFACE_SLIPPERY` | `0x0014` | Moderate slip |
+| `SURFACE_NOT_SLIPPERY` | `0x0015` | No slip, also used for climbable ceilings |
+| `SURFACE_ICE` | `0x002E` | Slippery ice (CCM, THI water floor) |
+| `SURFACE_HARD` | `0x0030` | Always causes fall damage regardless of height |
+| `SURFACE_SHALLOW_QUICKSAND` | `0x0021` | 10 units deep, escapable |
+| `SURFACE_DEEP_QUICKSAND` | `0x0022` | 160 units deep, lethal |
+| `SURFACE_INSTANT_QUICKSAND` | `0x0023` | Lethal immediately |
+| `SURFACE_HORIZONTAL_WIND` | `0x002C` | Applies horizontal wind force; `force` encodes direction |
+| `SURFACE_VERTICAL_WIND` | `0x0038` | Upward wind in vertical wind areas |
+| `SURFACE_HANGABLE` | `0x0005` | Ceiling Mario can hang and crawl on |
+</Accordion>
+
+<Accordion title="Warp and camera types">
+| Constant | Value | Effect |
+|---|---|---|
+| `SURFACE_INSTANT_WARP_1B`–`1E` | `0x001B`–`0x001E` | Teleport to another area immediately on contact |
+| `SURFACE_WARP` | `0x0032` | Generic surface warp |
+| `SURFACE_CAMERA_BOUNDARY` | `0x0072` | Invisible intangible wall only the camera collides with |
+| `SURFACE_VANISH_CAP_WALLS` | `0x007B` | Passable with Vanish Cap or `ACTIVE_FLAG_MOVE_THROUGH_GRATE` |
+| `SURFACE_BOSS_FIGHT_CAMERA` | `0x0065` | Widens camera for BoB/WF boss arenas |
+</Accordion>
+
+<Accordion title="Surface class macros">
+```c
+// include/surface_terrains.h
+#define SURFACE_CLASS_DEFAULT       0x0000
+#define SURFACE_CLASS_VERY_SLIPPERY 0x0013
+#define SURFACE_CLASS_SLIPPERY      0x0014
+#define SURFACE_CLASS_NOT_SLIPPERY  0x0015
+
+// Helper predicates
+#define SURFACE_IS_QUICKSAND(cmd)     (cmd >= 0x21 && cmd < 0x28)
+#define SURFACE_IS_NOT_HARD(cmd)      (cmd != SURFACE_HARD && !(cmd >= 0x35 && cmd <= 0x37))
+#define SURFACE_IS_PAINTING_WARP(cmd) (cmd >= 0xD3 && cmd < 0xFD)
+```
+
+`mario_get_floor_class()` in `src/game/mario.c` maps the floor's raw `type` field to one of these four class constants, which are what the movement code actually branches on for friction calculations.
+</Accordion>
+
+---
+
+## Collision data format in level scripts
+
+Static collision geometry is compiled into arrays of `Collision` (`s16`) values embedded in level segment data. The format is read by `load_area_terrain()` in `surface_load.c`. The collision macro helpers from `include/surface_terrains.h`:
+
+```c
+// Start a collision block
+COL_INIT()                // emits TERRAIN_LOAD_VERTICES (0x0040)
+
+// Define the vertex pool
+COL_VERTEX_INIT(vtxNum)   // number of vertices to follow
+COL_VERTEX(x, y, z)       // one vertex (three s16 values)
+
+// Define triangles referencing vertex indices
+COL_TRI_INIT(surfType, triNum)  // surface type + count
+COL_TRI(v1, v2, v3)            // indices into vertex pool
+COL_TRI_SPECIAL(v1, v2, v3, param)  // triangle with force parameter
+
+COL_TRI_STOP()            // emits TERRAIN_LOAD_CONTINUE (0x0041)
+COL_END()                 // emits TERRAIN_LOAD_END (0x0042)
+
+// Optional: static object placements
+COL_SPECIAL_INIT(num)     // TERRAIN_LOAD_OBJECTS (0x0043)
+
+// Optional: water/gas boxes
+COL_WATER_BOX_INIT(num)   // TERRAIN_LOAD_ENVIRONMENT (0x0044)
+COL_WATER_BOX(id, x1, z1, x2, z2, y)
+```
+
+An example from a hypothetical simple platform:
+
+```c
+static const Collision my_platform_collision[] = {
+    COL_INIT(),
+    COL_VERTEX_INIT(4),
+    COL_VERTEX(-200,  0, -200),
+    COL_VERTEX( 200,  0, -200),
+    COL_VERTEX( 200,  0,  200),
+    COL_VERTEX(-200,  0,  200),
+    COL_TRI_INIT(SURFACE_DEFAULT, 2),
+    COL_TRI(0, 1, 2),
+    COL_TRI(0, 2, 3),
+    COL_TRI_STOP(),
+    COL_END(),
+};
+```
+
+### Object collision
+
+Dynamic objects register their collision model via `load_object_collision_model()`, called each frame for any active object with a collision data pointer (`collisionData` field on `struct Object`). This re-inserts all triangles of the object's mesh into `gDynamicSurfacePartition` transformed to world space, with `surface->object` pointing back to the owning object and `SURFACE_FLAG_DYNAMIC` set in the flags.
+
+---
+
+## Terrain sound types
+
+The `terrain_type` level script command (cmd 0x31) sets the level's terrain sound category, which is mixed into footstep and landing sound IDs:
+
+```c
+// include/surface_terrains.h
+#define TERRAIN_GRASS  0x0000
+#define TERRAIN_STONE  0x0001
+#define TERRAIN_SNOW   0x0002
+#define TERRAIN_SAND   0x0003
+#define TERRAIN_SPOOKY 0x0004
+#define TERRAIN_WATER  0x0005
+#define TERRAIN_SLIDE  0x0006
+#define TERRAIN_MASK   0x0007
+```
+
+`mario_get_terrain_sound_addend()` in `src/game/mario.c` returns a value derived from the floor's surface type and the level terrain type. This addend is stored in `MarioState.terrainSoundAddend` and added to the base sound ID when playing footstep sounds, selecting the correct surface-specific audio variant.
+
+<Tip>
+  When `Surface.object` is non-NULL, checking `surface->object->behavior` is a reliable way to determine what kind of platform or object produced the surface, useful for writing custom interactions with specific moving objects.
+</Tip>
+
+<Warning>
+  Parallel Universes (PU) occur because `find_ceil()` and `find_floor()` cast the float position to `s16` before the grid cell lookup. At `|pos| >= 32768`, the cast wraps to a negative value and queries the wrong partition cell. Any mod that relies on positions outside `[-8192, +8192]` must be aware that collision queries will misbehave at those coordinates.
+</Warning>

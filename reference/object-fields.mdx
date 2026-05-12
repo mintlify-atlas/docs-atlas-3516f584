@@ -1,0 +1,357 @@
+---
+title: "Object fields and rawData union in SM64 objects"
+description: "How object_fields.h constants index SM64's rawData union — reference for oFlags, oAction, position, velocity, physics, and interaction field slots."
+---
+
+Every interactive entity in SM64 is a `struct Object`. The bulk of that struct — bytes `0x088` through `0x1C7` — is a union called `rawData` that holds 0x50 (80) slots of object-specific data. Behavior scripts and C code access these slots through named `#define` constants declared in `include/object_fields.h`. Understanding how these field names map to the underlying union is the key to reading any behavior file in the repository.
+
+## The rawData union
+
+`struct Object` is defined in `include/types.h`. Its variant data section is:
+
+```c
+struct Object {
+    /*0x000*/ struct ObjectNode header;   // graphic node + linked list
+    /*0x068*/ struct Object *parentObj;
+    /*0x06C*/ struct Object *prevObj;
+    /*0x070*/ u32  collidedObjInteractTypes;
+    /*0x074*/ s16  activeFlags;
+    /*0x076*/ s16  numCollidedObjs;
+    /*0x078*/ struct Object *collidedObjs[4];
+
+    /*0x088*/
+    union {
+        u32  asU32[0x50];
+        s32  asS32[0x50];
+        s16  asS16[0x50][2];
+        f32  asF32[0x50];
+        // pointer views (32-bit build only; 64-bit uses ptrData)
+        struct Object   *asObject[0x50];
+        struct Surface  *asSurface[0x50];
+        void            *asVoidPtr[0x50];
+        // ... other pointer types
+    } rawData;
+
+    /*0x1C8*/ u32 unused1;
+    /*0x1CC*/ const BehaviorScript *curBhvCommand;
+    // ... rest of struct
+};
+```
+
+The union occupies `0x50 * 4 = 320` bytes (`0x088`–`0x1C7`). Each slot is four bytes wide and may be read as `u32`, `s32`, two `s16` sub-slots, `f32`, or a pointer.
+
+<Note>
+  On 64-bit host builds (PC ports), pointer-type fields are moved into a separate `ptrData` union so that the 32-bit `rawData` slots retain their original sizes. The accessor macros handle this transparently.
+</Note>
+
+## Accessor macros
+
+`include/object_fields.h` defines a family of macros that expand differently depending on whether the code is being compiled for indexing (`OBJECT_FIELDS_INDEX_DIRECTLY`) or for the actual struct:
+
+```c
+// Normal build — expands to a struct member access:
+#define OBJECT_FIELD_U32(index)           rawData.asU32[index]
+#define OBJECT_FIELD_S32(index)           rawData.asS32[index]
+#define OBJECT_FIELD_S16(index, subIndex) rawData.asS16[index][subIndex]
+#define OBJECT_FIELD_F32(index)           rawData.asF32[index]
+#define OBJECT_FIELD_OBJ(index)           rawData.asObject[index]
+#define OBJECT_FIELD_SURFACE(index)       rawData.asSurface[index]
+#define OBJECT_FIELD_VPTR(index)          rawData.asVoidPtr[index]
+// ... etc.
+```
+
+These macros are never called directly by behavior code. Instead, the named field constants below expand to them:
+
+```c
+// From object_fields.h:
+#define oPosX  OBJECT_FIELD_F32(0x06)
+// so o->oPosX expands to o->rawData.asF32[0x06]
+```
+
+## Field naming convention
+
+All shared object field names begin with a lowercase **`o`** prefix (for "object"), followed by a descriptive CamelCase name:
+
+- `oFlags`, `oTimer`, `oAction` — general state
+- `oPosX`, `oPosY`, `oPosZ` — position
+- `oVelX`, `oVelY`, `oVelZ` — velocity
+- `oMoveAngleYaw`, `oFaceAngleYaw` — angles
+
+Object-specific fields follow the same `o` prefix but include the object type: `oBooBaseScale`, `oGoombaWalkTimer`, `oChainChompSegments`, and so on.
+
+## Common fields reference
+
+The fields below are present in (or meaningful for) nearly every active object. Slot indices in comments are the raw hex indices into `rawData`.
+
+### Behaviour and state
+
+<ResponseField name="oFlags" type="u32 — slot 0x01">
+  Bitmask controlling the object update system's per-frame operations. Common bits:
+
+  | Constant | Value | Effect |
+  |----------|-------|--------|
+  | `OBJ_FLAG_UPDATE_GFX_POS_AND_ANGLE`     | `0x00000001` | Sync graphic node position/angle each frame |
+  | `OBJ_FLAG_MOVE_XZ_USING_FVEL`           | `0x00000002` | Apply `oForwardVel` in the XZ plane |
+  | `OBJ_FLAG_MOVE_Y_WITH_TERMINAL_VEL`     | `0x00000004` | Apply gravity with terminal velocity cap |
+  | `OBJ_FLAG_SET_FACE_YAW_TO_MOVE_YAW`     | `0x00000008` | Copy move yaw to face yaw |
+  | `OBJ_FLAG_COMPUTE_DIST_TO_MARIO`        | `0x00000040` | Update `oDistanceToMario` each frame |
+  | `OBJ_FLAG_COMPUTE_ANGLE_TO_MARIO`       | `0x00002000` | Update `oAngleToMario` each frame |
+  | `OBJ_FLAG_HOLDABLE`                     | `0x00000400` | Mario can pick this object up |
+</ResponseField>
+
+<ResponseField name="oTimer" type="s32 — slot 0x33">
+  General-purpose timer incremented by 1 every frame the object is active. Behavior scripts reset this with `SET_INT(oTimer, 0)` when entering a new action.
+</ResponseField>
+
+<ResponseField name="oAction" type="s32 — slot 0x31">
+  Current action state. Behavior scripts switch on this to implement state machines.
+</ResponseField>
+
+<ResponseField name="oPrevAction" type="s32 — slot 0x41">
+  Previous action; written automatically when `oAction` changes via `SET_INT`.
+</ResponseField>
+
+<ResponseField name="oSubAction" type="s32 — slot 0x32">
+  Secondary action state for objects with two-level state machines (e.g., an enemy that is both `ACT_CHASE` and `ACT_CHASE_TURN`).
+</ResponseField>
+
+<ResponseField name="oBhvParams" type="s32 — slot 0x40">
+  The full 32-bit behavior parameter word, typically set by the object placement macro or level script. The upper byte is the most common parameter byte read in behaviors.
+</ResponseField>
+
+<ResponseField name="oBhvParams2ndByte" type="s32 — slot 0x2F">
+  The second byte of `oBhvParams`, extracted and sign-extended to `s32` for convenience. Used so frequently it has its own name.
+</ResponseField>
+
+### Position and velocity
+
+<ResponseField name="oPosX / oPosY / oPosZ" type="f32 — slots 0x06 / 0x07 / 0x08">
+  World-space position. These are read by the graphics engine each frame to position the model (when `OBJ_FLAG_UPDATE_GFX_POS_AND_ANGLE` is set). `O_POS_INDEX = 0x06` is the base slot; the three fields occupy consecutive slots.
+</ResponseField>
+
+<ResponseField name="oVelX / oVelY / oVelZ" type="f32 — slots 0x09 / 0x0A / 0x0B">
+  World-space velocity components, applied directly to the position each frame by the physics engine.
+</ResponseField>
+
+<ResponseField name="oForwardVel" type="f32 — slot 0x0C">
+  Speed along the object's current move-angle yaw direction. The flag `OBJ_FLAG_MOVE_XZ_USING_FVEL` converts this into `oVelX` / `oVelZ` each frame. Also aliased as `oForwardVelS32` (same slot, `s32` view).
+</ResponseField>
+
+<ResponseField name="oLeftVel" type="f32 — slot 0x0D">
+  Lateral (strafing) velocity component.
+</ResponseField>
+
+<ResponseField name="oUpVel" type="f32 — slot 0x0E">
+  Vertical velocity component used by some objects instead of `oVelY`.
+</ResponseField>
+
+<ResponseField name="oHomeX / oHomeY / oHomeZ" type="f32 — slots 0x37 / 0x38 / 0x39">
+  Spawn / home position. Many enemies return to these coordinates when idle.
+</ResponseField>
+
+### Angles
+
+All angles are stored as `s32` (sign-extended from `s16` BAM units).
+
+<ResponseField name="oMoveAnglePitch / oMoveAngleYaw / oMoveAngleRoll" type="s32 — slots 0x0F / 0x10 / 0x11">
+  The direction in which the object moves. `oForwardVel` is applied along `oMoveAngleYaw`. Base index `O_MOVE_ANGLE_INDEX = 0x0F`.
+</ResponseField>
+
+<ResponseField name="oFaceAnglePitch / oFaceAngleYaw / oFaceAngleRoll" type="s32 — slots 0x12 / 0x13 / 0x14">
+  The direction the object's model faces visually. Base index `O_FACE_ANGLE_INDEX = 0x12`. The flag `OBJ_FLAG_SET_FACE_YAW_TO_MOVE_YAW` keeps move and face yaw in sync automatically.
+</ResponseField>
+
+<ResponseField name="oAngleVelPitch / oAngleVelYaw / oAngleVelRoll" type="s32 — slots 0x23 / 0x24 / 0x25">
+  Per-frame rotation speed added to the corresponding face angle by the spinning/tumbling physics.
+</ResponseField>
+
+<ResponseField name="oAngleToMario" type="s32 — slot 0x36">
+  Yaw angle (in BAM units) from this object toward Mario. Updated automatically when `OBJ_FLAG_COMPUTE_ANGLE_TO_MARIO` is set.
+</ResponseField>
+
+<ResponseField name="oAngleToHome" type="s32 — slot 0x4D">
+  Yaw angle from this object toward its home position.
+</ResponseField>
+
+### Physics
+
+<ResponseField name="oGravity" type="f32 — slot 0x17">
+  Per-frame downward acceleration applied to `oVelY`. Negative values pull the object down.
+</ResponseField>
+
+<ResponseField name="oFloorHeight" type="f32 — slot 0x18">
+  Y coordinate of the floor directly beneath the object, updated by the collision system.
+</ResponseField>
+
+<ResponseField name="oMoveFlags" type="u32 — slot 0x19">
+  Bitmask of movement state flags updated every frame:
+
+  | Constant | Value | Meaning |
+  |----------|-------|---------|
+  | `OBJ_MOVE_LANDED`                | `0x0001` | Just hit the ground this frame |
+  | `OBJ_MOVE_ON_GROUND`             | `0x0002` | Resting on the floor |
+  | `OBJ_MOVE_LEFT_GROUND`           | `0x0004` | Left the floor this frame |
+  | `OBJ_MOVE_ENTERED_WATER`         | `0x0008` | Entered a water body |
+  | `OBJ_MOVE_AT_WATER_SURFACE`      | `0x0010` | At the water surface |
+  | `OBJ_MOVE_UNDERWATER_ON_GROUND`  | `0x0040` | On the floor underwater |
+  | `OBJ_MOVE_IN_AIR`                | `0x0080` | Airborne |
+  | `OBJ_MOVE_HIT_WALL`              | `0x0200` | Collided with a wall |
+  | `OBJ_MOVE_ABOVE_LAVA`            | `0x0800` | Over a lava surface |
+</ResponseField>
+
+<ResponseField name="oFloor" type="struct Surface * — slot 0x4E">
+  Pointer to the `Surface` triangle beneath the object. Filled in by the collision system.
+</ResponseField>
+
+<ResponseField name="oFloorType" type="s16 — slot 0x4C, sub 0">
+  Surface type constant of the floor triangle below (e.g., `SURFACE_BURNING`). Extracted from `oFloor->type` by the physics system for convenience.
+</ResponseField>
+
+<ResponseField name="oFloorRoom" type="s16 — slot 0x4C, sub 1">
+  Room index of the floor triangle below.
+</ResponseField>
+
+<ResponseField name="oWallAngle" type="s32 — slot 0x4B">
+  Yaw angle of the last wall the object collided with.
+</ResponseField>
+
+<ResponseField name="oBounciness" type="f32 — slot 0x34">
+  Coefficient applied to `oVelY` on a floor bounce. `1.0` = perfectly elastic.
+</ResponseField>
+
+<ResponseField name="oFriction" type="f32 — slot 0x3A">
+  Horizontal speed multiplier applied per frame on the ground (typically `< 1.0` to decelerate).
+</ResponseField>
+
+<ResponseField name="oBuoyancy" type="f32 — slot 0x3B">
+  Upward force applied while the object is underwater.
+</ResponseField>
+
+<ResponseField name="oDragStrength" type="f32 — slot 0x29">
+  Air/water drag: `forwardVel` is multiplied by `(1 - oDragStrength)` each frame.
+</ResponseField>
+
+### Interaction and hitbox
+
+<ResponseField name="oInteractType" type="u32 — slot 0x2A">
+  Bitmask describing what kind of interaction this object presents to Mario (e.g., coin, enemy, hold-able object). See `INTERACT_*` constants in `object_constants.h`.
+</ResponseField>
+
+<ResponseField name="oInteractStatus" type="s32 — slot 0x2B">
+  Set by the interaction system to indicate what happened (e.g., `INT_STATUS_HIT_MARIO`). Cleared after the behavior processes it.
+</ResponseField>
+
+<ResponseField name="oInteractionSubtype" type="u32 — slot 0x42">
+  Additional flags qualifying the interaction (e.g., which cap this pickup awards).
+</ResponseField>
+
+<ResponseField name="oDamageOrCoinValue" type="s32 — slot 0x3E">
+  When this object damages Mario: the amount of health to subtract. When it is a coin: the coin value. Also referred to via the `ObjectHitbox` struct's `damageOrCoinValue` field.
+</ResponseField>
+
+<ResponseField name="oNumLootCoins" type="s32 — slot 0x44">
+  Number of coins spawned when this object is defeated.
+</ResponseField>
+
+<ResponseField name="oHealth" type="s32 — slot 0x3F">
+  The object's hit points. Decremented by `INT_PUNCH` / `INT_KICK` interactions.
+</ResponseField>
+
+### Visibility and rendering
+
+<ResponseField name="oGraphYOffset" type="f32 — slot 0x15">
+  Vertical rendering offset added to `oPosY` for the graphic node, without affecting collision. Useful for bobbing effects.
+</ResponseField>
+
+<ResponseField name="oOpacity" type="s32 — slot 0x3D">
+  Alpha value in the range 0–255. Passed to the RSP to blend the object's model.
+</ResponseField>
+
+<ResponseField name="oDrawingDistance" type="f32 — slot 0x45">
+  Objects whose distance to the camera exceeds this value are culled.
+</ResponseField>
+
+<ResponseField name="oCollisionDistance" type="f32 — slot 0x43">
+  The radius at which the object's collision sphere is checked against Mario.
+</ResponseField>
+
+<ResponseField name="oWallHitboxRadius" type="f32 — slot 0x28">
+  Radius used for wall-collision checks against other objects.
+</ResponseField>
+
+### Room and distance tracking
+
+<ResponseField name="oRoom" type="s32 — slot 0x46">
+  Room index the object currently occupies (from `RoomData`). The object is culled when Mario is in a different room and `ACTIVE_FLAG_IN_DIFFERENT_ROOM` is set.
+</ResponseField>
+
+<ResponseField name="oDistanceToMario" type="f32 — slot 0x35">
+  Euclidean distance from this object to Mario. Updated each frame when `OBJ_FLAG_COMPUTE_DIST_TO_MARIO` is set.
+</ResponseField>
+
+### Misc
+
+<ResponseField name="oAnimState" type="s32 — slot 0x1A">
+  Selects which animation variant to play (maps to an index in the object's animation list).
+</ResponseField>
+
+<ResponseField name="oAnimations" type="struct Animation ** — slot 0x26">
+  Pointer to the object's animation list (array of `struct Animation *`).
+</ResponseField>
+
+<ResponseField name="oHeldState" type="u32 — slot 0x27">
+  Whether Mario is holding this object. Values: `HELD_FREE` (0), `HELD_HELD` (1), `HELD_THROWN` (2), `HELD_DROPPED` (3).
+</ResponseField>
+
+<ResponseField name="oDeathSound" type="s32 — slot 0x4F">
+  Sound effect ID to play when this object is defeated.
+</ResponseField>
+
+<ResponseField name="oIntangibleTimer" type="s32 — slot 0x05">
+  When non-zero, the object cannot be interacted with. Decremented each frame.
+</ResponseField>
+
+## Accessing object fields
+
+```c
+// Via the named macro (preferred):
+o->oPosX = 100.0f;
+o->oMoveAngleYaw += 0x100;
+
+// Equivalent manual access:
+o->rawData.asF32[0x06] = 100.0f;
+o->rawData.asS32[0x10] += 0x100;
+```
+
+Always use the named constants. They are portable across 32-bit and 64-bit builds because the pointer macros switch between `rawData` and `ptrData` automatically.
+
+## Object-specific fields
+
+The region `0x0F4`–`0x110` (slots `0x1B`–`0x22`) and `0x1AC`–`0x1B4` (slots `0x49`–`0x4A`) are **not** part of the common field set. Each object type uses them for its own purpose. For example:
+
+```c
+/* Goomba */
+#define oGoombaSize      OBJECT_FIELD_S32(0x1B)
+#define oGoombaScale     OBJECT_FIELD_F32(0x1C)
+#define oGoombaWalkTimer OBJECT_FIELD_S32(0x1D)
+
+/* Chain Chomp */
+#define oChainChompSegments                     OBJECT_FIELD_CHAIN_SEGMENT(0x1B)
+#define oChainChompMaxDistFromPivotPerChainPart OBJECT_FIELD_F32(0x1C)
+#define oChainChompNumLunges                    OBJECT_FIELD_S32(0x22)
+```
+
+See `include/object_fields.h` for the complete list, organized by object type.
+
+## The first slot (0x00 / 0x088)
+
+Slot `0x00` at offset `0x088` is reserved for object-type-specific use and is **not** part of the common fields. Some objects use it for a primary state value:
+
+```c
+#define oBooDeathStatus         OBJECT_FIELD_S32(0x00) // Boo
+#define oBowserCamAct           OBJECT_FIELD_S32(0x00) // Bowser
+#define oMerryGoRoundStopped    OBJECT_FIELD_S32(0x00) // Merry-Go-Round
+#define oPlatformOnTrackBaseBallIndex OBJECT_FIELD_S32(0x00) // Track Platform
+```
+
+For objects that do not define a meaning for slot 0x00, it is effectively unused.

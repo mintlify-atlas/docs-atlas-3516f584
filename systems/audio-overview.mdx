@@ -1,0 +1,435 @@
+---
+title: 'Audio engine: sequences, sounds, and banks in SM64'
+description: 'How SM64 drives music, sound effects, and ambient audio through the N64 RSP, covering sequence players, sound banks, the public API, and version differences.'
+---
+
+SM64's audio engine is a custom RSP-accelerated system that runs entirely on the Nintendo 64's Reality Signal Processor. Game code on the CPU submits high-level requests — play a sequence, trigger a sound effect, fade out the music — and the audio subsystem translates those into RSP microcode tasks that synthesize PCM samples directly into the Audio Interface (AI) DMA buffers each frame.
+
+## Architecture overview
+
+The engine has three distinct layers, each handled by a dedicated sequence player slot.
+
+<CardGroup cols={3}>
+  <Card title="Sequence player (music)" icon="music">
+    Drives background music and event jingles using a MIDI-like binary script format called M64. Up to 16 channels per player.
+  </Card>
+  <Card title="Sound effects" icon="volume-2">
+    Positional one-shot and continuous sounds triggered by game objects. Managed through sound banks with a priority and status system.
+  </Card>
+  <Card title="Ambient / environment" icon="wind">
+    Looping ambient audio (wind, water) handled via the same sound bank mechanism but in dedicated banks such as `SOUND_BANK_ENV`.
+  </Card>
+</CardGroup>
+
+### Sequence players
+
+Three global `SequencePlayer` slots exist in JP/US (four in EU/Shindou):
+
+```c
+// from src/audio/load.h
+// gSequencePlayers[0] is level background music
+// gSequencePlayers[1] is misc music, like the puzzle jingle
+// gSequencePlayers[2] is sound
+extern struct SequencePlayer gSequencePlayers[SEQUENCE_PLAYERS];
+```
+
+Player indices are exposed as constants in `external.h`:
+
+```c
+#define SEQ_PLAYER_LEVEL  0  // Level background music
+#define SEQ_PLAYER_ENV    1  // Misc music like the puzzle jingle
+#define SEQ_PLAYER_SFX    2  // Sound effects
+```
+
+### Per-frame pipeline
+
+<Steps>
+  <Step title="Game loop tick">
+    `audio_signal_game_loop_tick()` is called once per game frame to advance internal counters.
+  </Step>
+  <Step title="Audio frame task creation">
+    `create_next_audio_frame_task()` runs the sequence players, processes queued sound effects, invokes the synthesis pipeline, and builds an RSP task (`SPTask`).
+  </Step>
+  <Step title="RSP execution">
+    The task is dispatched to the RSP, which runs the audio microcode found in `sound/rsp/`. Sample data is DMA'd from ROM on demand by `dma_sample_data()`.
+  </Step>
+  <Step title="AI DMA">
+    Synthesized PCM is written to one of three rotating AI buffers (`gAiBuffers[NUMAIBUFFERS]`) and handed to the Audio Interface hardware.
+  </Step>
+</Steps>
+
+---
+
+## Audio banks and instrument data
+
+"Audio bank" refers to the instrument/sample ROM blobs loaded by the CTL/TBL system — distinct from "sound banks" (the categorical groupings in `sounds.h`).
+
+```c
+// from src/audio/load.h
+extern ALSeqFile *gAlCtlHeader; // instrument control header
+extern ALSeqFile *gAlTbl;       // sample table (waveform data)
+extern ALSeqFile *gSeqFileHeader; // sequence file header
+extern u8 *gAlBankSets;
+
+extern struct CtlEntry *gCtlEntries;
+```
+
+Each `CtlEntry` describes one audio bank — how many instruments and drums it contains and where their data lives:
+
+```c
+// from src/audio/internal.h
+struct CtlEntry {
+    u8 numInstruments;
+    u8 numDrums;
+    struct Instrument **instruments;
+    struct Drum **drums;
+}; // size = 0xC
+```
+
+Individual instruments hold three sample ranges (low, normal, high notes) plus ADSR envelope data:
+
+```c
+struct Instrument {
+    /*0x00*/ u8 loaded;
+    /*0x01*/ u8 normalRangeLo;
+    /*0x02*/ u8 normalRangeHi;
+    /*0x03*/ u8 releaseRate;
+    /*0x04*/ struct AdsrEnvelope *envelope;
+    /*0x08*/ struct AudioBankSound lowNotesSound;
+    /*0x10*/ struct AudioBankSound normalNotesSound;
+    /*0x18*/ struct AudioBankSound highNotesSound;
+}; // size = 0x20
+```
+
+Sample data is ADPCM-compressed (codec `0`) or raw signed-8-bit (codec `1`). Loop points are stored in `AdpcmLoop` and the ADPCM codebook in `AdpcmBook`.
+
+---
+
+## Sequence format (M64)
+
+Music sequences are binary scripts interpreted by the sequence player each audio frame. The format is MIDI-inspired: commands encode note events, tempo changes, channel routing, and volume/transpose control. The script state for each active player or channel is tracked in `M64ScriptState`:
+
+```c
+// from src/audio/internal.h
+struct M64ScriptState {
+    u8 *pc;           // program counter into sequence data
+    u8 *stack[4];     // call stack (supports 4 levels of subroutine)
+    u8 remLoopIters[4];
+    u8 depth;
+}; // size = 0x1C
+```
+
+Sequences are preloaded with `preload_sequence()` and activated via `load_sequence()`.
+
+<Note>
+  A sequence ID may be OR'd with `SEQ_VARIATION` (`0x80`) to load the same sequence script but set a variation bit that the script can read to alter its behaviour at runtime.
+</Note>
+
+---
+
+## Sequence IDs
+
+Every piece of music in the game is identified by a value from the `SeqId` enum in `include/seq_ids.h`. The full list:
+
+```c
+enum SeqId {
+    SEQ_SOUND_PLAYER,                 // 0x00 — internal sound-effect player
+    SEQ_EVENT_CUTSCENE_COLLECT_STAR,  // 0x01
+    SEQ_MENU_TITLE_SCREEN,            // 0x02
+    SEQ_LEVEL_GRASS,                  // 0x03
+    SEQ_LEVEL_INSIDE_CASTLE,          // 0x04
+    SEQ_LEVEL_WATER,                  // 0x05
+    SEQ_LEVEL_HOT,                    // 0x06
+    SEQ_LEVEL_BOSS_KOOPA,             // 0x07
+    SEQ_LEVEL_SNOW,                   // 0x08
+    SEQ_LEVEL_SLIDE,                  // 0x09
+    SEQ_LEVEL_SPOOKY,                 // 0x0A
+    SEQ_EVENT_PIRANHA_PLANT,          // 0x0B
+    SEQ_LEVEL_UNDERGROUND,            // 0x0C
+    SEQ_MENU_STAR_SELECT,             // 0x0D
+    SEQ_EVENT_POWERUP,                // 0x0E
+    SEQ_EVENT_METAL_CAP,              // 0x0F
+    SEQ_EVENT_KOOPA_MESSAGE,          // 0x10
+    SEQ_LEVEL_KOOPA_ROAD,             // 0x11
+    SEQ_EVENT_HIGH_SCORE,             // 0x12
+    SEQ_EVENT_MERRY_GO_ROUND,         // 0x13
+    SEQ_EVENT_RACE,                   // 0x14
+    SEQ_EVENT_CUTSCENE_STAR_SPAWN,    // 0x15
+    SEQ_EVENT_BOSS,                   // 0x16
+    SEQ_EVENT_CUTSCENE_COLLECT_KEY,   // 0x17
+    SEQ_EVENT_ENDLESS_STAIRS,         // 0x18
+    SEQ_LEVEL_BOSS_KOOPA_FINAL,       // 0x19
+    SEQ_EVENT_CUTSCENE_CREDITS,       // 0x1A
+    SEQ_EVENT_SOLVE_PUZZLE,           // 0x1B
+    SEQ_EVENT_TOAD_MESSAGE,           // 0x1C
+    SEQ_EVENT_PEACH_MESSAGE,          // 0x1D
+    SEQ_EVENT_CUTSCENE_INTRO,         // 0x1E
+    SEQ_EVENT_CUTSCENE_VICTORY,       // 0x1F
+    SEQ_EVENT_CUTSCENE_ENDING,        // 0x20
+    SEQ_MENU_FILE_SELECT,             // 0x21
+    SEQ_EVENT_CUTSCENE_LAKITU,        // 0x22 (not in JP)
+    SEQ_COUNT
+};
+```
+
+Sequences with the `SEQ_LEVEL_` prefix are level background tracks. `SEQ_EVENT_` sequences are one-shot jingles. `SEQ_MENU_` sequences play during menu screens.
+
+`SEQ_MENU_GAME_OVER` is a special alias defined as `SEQ_MENU_TITLE_SCREEN | SEQ_VARIATION`.
+
+---
+
+## Sound effect IDs and banks
+
+Sound effects are packed into a 32-bit `soundBits` word using the `SOUND_ARG_LOAD` macro:
+
+```c
+// from include/sounds.h
+#define SOUND_ARG_LOAD(bank, soundID, priority, flags) (\
+    ((u32) (bank) << 28) | \
+    ((u32) (soundID) << 16) | \
+    ((u32) (priority) << 8) | \
+    (flags) | \
+    SOUND_STATUS_WAITING)
+```
+
+The upper nibble of the word selects the **sound bank** — a categorical grouping that controls which channel the sound competes on and how it behaves when muted:
+
+```c
+#define SOUND_BANK_ACTION   0   // Mario movement actions
+#define SOUND_BANK_MOVING   1   // Locomotion/terrain-dependent sounds
+#define SOUND_BANK_VOICE    2   // Character voice clips
+#define SOUND_BANK_GENERAL  3   // General-purpose one-shots
+#define SOUND_BANK_ENV      4   // Looping ambient environment
+#define SOUND_BANK_OBJ      5   // Object interactions
+#define SOUND_BANK_AIR      6   // Wind / air sounds
+#define SOUND_BANK_MENU     7   // UI / menu sounds
+#define SOUND_BANK_GENERAL2 8
+#define SOUND_BANK_OBJ2     9
+```
+
+### Playback flags
+
+Two groups of bitflags further control behaviour. Upper bitflags (bits 24-27):
+
+```c
+#define SOUND_NO_VOLUME_LOSS      0x1000000 // No volume loss with distance
+#define SOUND_VIBRATO             0x2000000 // Randomly alter frequency each audio frame
+#define SOUND_NO_PRIORITY_LOSS    0x4000000 // Do not prioritize closer sounds
+#define SOUND_CONSTANT_FREQUENCY  0x8000000 // Frequency unaffected by distance/speed
+```
+
+Lower bitflags (bits 4-7):
+
+```c
+#define SOUND_LOWER_BACKGROUND_MUSIC  0x10 // Lower BGM volume while playing
+#define SOUND_NO_ECHO                 0x20 // Disable level reverb (not in JP)
+#define SOUND_DISCRETE                0x80 // Restart sound on every play_sound call
+```
+
+### Naming convention
+
+Sound constants follow a `SOUND_<BANK>_<DESCRIPTION>` pattern. Terrain-dependent sounds use offset IDs; the actual terrain type (0–7) is added to the base sound ID at runtime:
+
+```c
+#define SOUND_ACTION_TERRAIN_JUMP     SOUND_ARG_LOAD(SOUND_BANK_ACTION, 0x00, 0x80, SOUND_NO_PRIORITY_LOSS | SOUND_DISCRETE)
+#define SOUND_ACTION_TERRAIN_LANDING  SOUND_ARG_LOAD(SOUND_BANK_ACTION, 0x08, 0x80, SOUND_NO_PRIORITY_LOSS | SOUND_DISCRETE)
+#define SOUND_ACTION_TERRAIN_STEP     SOUND_ARG_LOAD(SOUND_BANK_ACTION, 0x10, 0x80, SOUND_VIBRATO | SOUND_NO_PRIORITY_LOSS | SOUND_DISCRETE)
+```
+
+---
+
+## Public API (`external.h`)
+
+All game code interacts with the audio engine through the functions declared in `src/audio/external.h`.
+
+### Music control
+
+```c
+// Play a sequence on a player slot. seqArgs is built with SEQUENCE_ARGS().
+void play_music(u8 player, u16 seqArgs, u16 fadeTimer);
+
+// Stop the background music sequence identified by seqId.
+void stop_background_music(u16 seqId);
+
+// Fade out background music over fadeOut frames, then silence.
+void fadeout_background_music(u16 arg0, u16 fadeOut);
+
+// Discard the next item from the background music queue.
+void drop_queued_background_music(void);
+
+// Return the seqId currently playing on SEQ_PLAYER_LEVEL.
+u16 get_current_background_music(void);
+
+// Start a secondary music layer (e.g. for Koopa race).
+void play_secondary_music(u8 seqId, u8 bgMusicVolume, u8 volume, u16 fadeTimer);
+```
+
+`SEQUENCE_ARGS` packs priority and sequence ID into the `seqArgs` word:
+
+```c
+#define SEQUENCE_ARGS(priority, seqId) ((priority << 8) | seqId)
+```
+
+### Volume and fade
+
+```c
+// Fade a player's volume to silence over fadeDuration frames.
+void seq_player_fade_out(u8 player, u16 fadeDuration);
+
+// Scale a player's volume towards targetScale over fadeDuration frames.
+void fade_volume_scale(u8 player, u8 targetScale, u16 fadeDuration);
+
+// Temporarily lower a player's volume by percentage, over fadeDuration frames.
+void seq_player_lower_volume(u8 player, u16 fadeDuration, u8 percentage);
+
+// Restore a previously lowered volume.
+void seq_player_unlower_volume(u8 player, u16 fadeDuration);
+
+// Mute or unmute all audio output.
+void set_audio_muted(u8 muted);
+```
+
+### Sound effects
+
+```c
+// Trigger a sound effect. soundBits is a packed SOUND_ARG_LOAD word;
+// pos is a pointer to a 3-component f32 world-space position.
+void play_sound(s32 soundBits, f32 *pos);
+
+// Stop a specific sound at the given source position.
+void stop_sound(u32 soundBits, f32 *pos);
+
+// Stop all sounds emitting from a position.
+void stop_sounds_from_source(f32 *pos);
+
+// Stop all sounds in banks flagged as continuous.
+void stop_sounds_in_continuous_banks(void);
+
+// Enable or disable entire sound banks for a player.
+void sound_banks_disable(u8 player, u16 bankMask);
+void sound_banks_enable(u8 player, u16 bankMask);
+
+// Set the movement speed used for SOUND_BANK_MOVING frequency scaling.
+void set_sound_moving_speed(u8 bank, u8 speed);
+```
+
+### Event jingles
+
+```c
+void play_course_clear(void);
+void play_peachs_jingle(void);
+void play_puzzle_jingle(void);
+void play_star_fanfare(void);
+void play_power_star_jingle(u8 arg0);
+void play_race_fanfare(void);
+void play_toads_jingle(void);
+void play_dialog_sound(u8 dialogID);
+```
+
+### System
+
+```c
+void sound_init(void);           // Initialise sound bank state
+void audio_init(void);           // Initialise audio heap and DMA (in load.c)
+void sound_reset(u8 presetId);   // Reset audio session with a given preset
+void audio_set_sound_mode(u8 arg0); // SOUND_MODE_STEREO / MONO / HEADSET
+```
+
+Output mode constants:
+
+```c
+#define SOUND_MODE_STEREO   0
+#define SOUND_MODE_MONO     3
+#define SOUND_MODE_HEADSET  1
+```
+
+---
+
+## Triggering sounds from game objects
+
+Game-side code uses helper functions from `src/game/spawn_sound.h` rather than calling `play_sound()` directly.
+
+```c
+// from src/game/spawn_sound.h
+
+struct SoundState {
+    s16 playSound;   // 1 = use this entry, 0 = skip
+    s8  animFrame1;  // animation frame at which to trigger (left foot)
+    s8  animFrame2;  // animation frame at which to trigger (right foot)
+    s32 soundMagic;  // SOUND_ARG_LOAD packed value
+};
+
+// Play soundMagic from the current object's position (one-shot style).
+void cur_obj_play_sound_1(s32 soundMagic);
+
+// Play soundMagic from the current object's position (continuous style).
+void cur_obj_play_sound_2(s32 soundMagic);
+
+// Spawn a dedicated sound-spawner object at the current object's position.
+void create_sound_spawner(s32 soundMagic);
+
+// Walk a SoundState table and fire sounds on matching animation frames.
+void exec_anim_sound_state(struct SoundState *soundStates);
+```
+
+<Tip>
+  `exec_anim_sound_state` is the standard way to synchronise footstep and impact sounds to animation frames. Pass it a `NULL`-terminated array of `SoundState` entries, one per distinct frame event.
+</Tip>
+
+---
+
+## Sound output modes
+
+```c
+// from external.h
+#define SOUND_MODE_STEREO   0
+#define SOUND_MODE_MONO     3
+#define SOUND_MODE_HEADSET  1
+```
+
+The headset mode activates per-channel headset pan effects tracked in `stereoHeadsetEffects` flags on both `SequenceChannel` and `Note`. Headset pan volumes are stored in `gHeadsetPanVolume[128]` and quantised through `gHeadsetPanQuantization`.
+
+---
+
+## RSP audio microcode
+
+The actual synthesis work is done by N64 RSP microcode stored in `sound/rsp/`. The CPU builds an RSP command list — a sequence of 64-bit words — each audio frame through the synthesis pipeline (`synthesis_execute()`), then hands the task to the RSP via the OS task system. The entry point on the CPU side is:
+
+```c
+// from src/audio/synthesis.h
+u64 *synthesis_execute(u64 *cmdBuf, s32 *writtenCmds, s16 *aiBuf, s32 bufLen);
+```
+
+Sample data needed by the RSP is DMA'd from ROM into a cache of small fixed-size buffers managed by `init_sample_dma_buffers()` and `dma_sample_data()`.
+
+---
+
+## Version differences
+
+<AccordionGroup>
+  <Accordion title="JP vs. US">
+    JP uses double-precision floating point in several places (the `US_FLOAT` macro wraps literals that become `f` suffixed on US). JP also has a different dialog voice for `DIALOG_037`. Tempo in JP is expressed in beats-per-minute; US and later versions use tatums-per-minute (`TEMPO_SCALE = TATUMS_PER_BEAT = 48`).
+  </Accordion>
+  <Accordion title="EU">
+    EU adds a fourth sequence player slot (`SEQUENCE_PLAYERS = 4`), increases channel and layer pool sizes, introduces `gAudioBufferParameters` for PAL/NTSC timing, and adds up to four independent reverb units (`gSynthesisReverbs[4]`). The `EuAudioCmd` struct routes audio parameter changes through a command queue rather than direct writes.
+  </Accordion>
+  <Accordion title="Shindou (SH)">
+    The Shindou revision adds `src/audio/synthesis_sh.c` and `src/audio/load_sh.c` as replacements for the standard synthesis and load modules. It introduces an async DMA pipeline for sample data (`PendingDmaSample`, `UnkStruct80343D00`), additional per-note `synthesisVolume` and `filter` fields, and expanded reverb pan controls (`panRight`/`panLeft` in `SynthesisReverb`). Shindou also uses a larger `AudioSessionSettingsEU` struct and an extended AI buffer length (`AIBUFFER_LEN = 0xb00`).
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Key global state
+
+| Symbol | Type | Description |
+|--------|------|-------------|
+| `gSequencePlayers[SEQUENCE_PLAYERS]` | `struct SequencePlayer[]` | All active sequence player slots |
+| `gSequenceChannels[SEQUENCE_CHANNELS]` | `struct SequenceChannel[]` | Pool of channel objects |
+| `gSequenceLayers[SEQUENCE_LAYERS]` | `struct SequenceChannelLayer[]` | Pool of layer objects |
+| `gNotes` | `struct Note *` | Pool of polyphonic note slots |
+| `gAiBuffers[3]` | `s16 *[]` | Rotating PCM output buffers |
+| `gAudioRandom` | `u32` | LFSR used for audio randomisation (vibrato, etc.) |
+| `gSoundMode` | `s8` | Current output mode (stereo/mono/headset) |
+| `gMaxSimultaneousNotes` | `s32` | Hard polyphony cap for current session preset |
+| `gAudioSessionPresets[18]` | `struct AudioSessionSettings[]` | Pre-defined audio quality/memory configurations |

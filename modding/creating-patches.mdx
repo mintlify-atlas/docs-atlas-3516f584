@@ -1,0 +1,166 @@
+---
+title: "Creating enhancement patches for the SM64 decomp"
+description: "Learn how to package your SM64 source modifications as reusable .patch files, apply them to other builds, and contribute them back to the project."
+---
+
+The enhancement patch system lets you bundle any set of source-code changes into a portable `.patch` file in git diff format. Anyone with the decompilation can apply your patch in seconds using `tools/apply_patch.sh`, and revert it just as easily. This page walks through the complete workflow, from making your first change to submitting a pull request.
+
+## Prerequisites
+
+- A working SM64 decompilation setup with the `master` branch checked out
+- `git` available on your `PATH`
+- `clang-format` installed (required before submitting patches)
+- Basic familiarity with C and the SM64 source layout
+
+## Workflow overview
+
+<Steps>
+  <Step title="Start from the master branch">
+    Always begin from a clean `master` branch. Enhancement patches are generated as diffs against `master`, so starting from any other commit will produce patches that cannot be applied cleanly by others.
+
+    ```bash
+    git checkout master
+    git status   # confirm no uncommitted changes
+    ```
+  </Step>
+  <Step title="Make your changes">
+    Edit, add, or delete source files however you like. You can touch as many files as necessary, but keeping each patch focused on a **single feature** makes it easier to apply, review, and revert.
+
+    Do **not** run `git add` or `git commit`. The `create_patch.sh` script handles staging internally and resets the index afterwards — committing beforehand will include your commit in the diff baseline rather than capturing your working-tree changes.
+  </Step>
+  <Step title="Format your code">
+    Before generating the patch, run `format.sh` to apply `clang-format` to all modified C source files. This keeps the patch consistent with the rest of the codebase and avoids spurious whitespace-only hunks.
+
+    ```bash
+    # Format all tracked source files at once
+    ./format.sh
+
+    # Or format only specific files
+    ./format.sh src/game/my_feature.c src/game/my_feature.h
+    ```
+
+    `format.sh` uses the `.clang-format` configuration file at the repository root, so the style is applied consistently without any extra flags.
+  </Step>
+  <Step title="Generate the patch file">
+    Run `tools/create_patch.sh` with the desired output path. By convention, patches are stored in `enhancements/` and named after the feature they add.
+
+    ```bash
+    tools/create_patch.sh enhancements/my_feature.patch
+    ```
+
+    Internally, the script runs:
+
+    ```bash
+    git add .
+    git diff -p --staged > enhancements/my_feature.patch
+    git reset
+    ```
+
+    It stages every untracked and modified file, captures the full diff, then resets the index — leaving your working tree unchanged.
+  </Step>
+  <Step title="Verify the patch">
+    Apply the patch to confirm it works on a clean checkout:
+
+    ```bash
+    tools/apply_patch.sh enhancements/my_feature.patch
+    make VERSION=us
+    ```
+
+    Then revert and rebuild to confirm the revert is clean:
+
+    ```bash
+    tools/revert_patch.sh enhancements/my_feature.patch
+    make VERSION=us
+    ```
+  </Step>
+</Steps>
+
+## The .patch file format
+
+Patches use the standard **unified diff** format produced by `git diff -p`. Each file change begins with a header like:
+
+```
+diff --git a/src/game/area.c b/src/game/area.c
+index af9d0156..c68a7f6e 100644
+--- a/src/game/area.c
++++ b/src/game/area.c
+@@ -363,6 +364,8 @@ void render_game(void) {
+```
+
+Lines prefixed with `+` are additions and lines prefixed with `-` are removals. New files appear with `--- /dev/null` as the source path. The patch is applied with `patch -p1`, which strips the leading `a/` and `b/` path prefixes.
+
+<Note>
+  Because `create_patch.sh` uses `git add .` before diffing, **all** untracked files in the repository will appear in the patch, not only the files you intentionally modified. Clean up any temporary or build artefacts before running the script.
+</Note>
+
+## Applying and reverting
+
+Once you have a `.patch` file, applying and reverting it use the same two scripts described on the [Enhancements](/modding/enhancements) page:
+
+```bash
+# Apply
+tools/apply_patch.sh enhancements/my_feature.patch
+
+# Revert
+tools/revert_patch.sh enhancements/my_feature.patch
+```
+
+Both scripts prompt for `[Y/N]` confirmation before touching any files. Applying runs `patch -p1 < patch_file` and reverting runs `patch -p1 -R < patch_file`.
+
+## Best practices
+
+<AccordionGroup>
+  <Accordion title="Keep each patch focused on one feature">
+    A patch that does one thing is much easier for others to understand, apply selectively, and review for correctness. If you find yourself writing a patch that fixes a bug **and** adds a new feature, split it into two separate `.patch` files.
+  </Accordion>
+  <Accordion title="Do not patch generated files">
+    The build system generates files such as `build/*/assets/mario_anim_data.c`, `build/*/assets/demo_data.c`, and the MIO0 compressed segments. These files are rebuilt from source every time `make` runs. Including them in a patch will cause conflicts on any machine where the build directory differs.
+
+    Similarly, avoid patching binary files (textures, audio) unless the patch intentionally replaces an asset, and document that clearly.
+  </Accordion>
+  <Accordion title="Use clang-format before every patch">
+    Run `./format.sh` on all modified files before calling `create_patch.sh`. Patches that mix style changes with functional changes are harder to review and may conflict with future formatting cleanups in the main repository.
+
+    ```bash
+    ./format.sh src/game/my_feature.c src/game/my_feature.h
+    ```
+  </Accordion>
+  <Accordion title="Write descriptive file-level comments">
+    Add a `@file` Doxygen comment at the top of any new `.c` file you create. Existing files in the codebase follow this pattern, and it makes the purpose of your addition immediately clear to readers of the patch diff.
+
+    ```c
+    /**
+     * @file my_feature.c
+     * Short description of what this file does and how to use it.
+     */
+    ```
+  </Accordion>
+  <Accordion title="Guard optional code with defines where appropriate">
+    If your patch adds behaviour that some users might want to disable, wrap it in a preprocessor define rather than requiring them to edit the source. Declare the define in `include/config.h` alongside the existing `BUGFIX_*` and `ENABLE_*` defines.
+  </Accordion>
+</AccordionGroup>
+
+## Contributing patches upstream
+
+If your enhancement is generally useful, consider submitting it to the project repository as a pull request.
+
+<Steps>
+  <Step title="Write a README entry">
+    Add a section to `enhancements/README.md` describing the patch: what it does, any setup required (scripts, emulator settings), and how to use any new functions it exposes. Follow the style of the existing entries.
+  </Step>
+  <Step title="Test on multiple versions">
+    Where possible, verify that the patch applies and builds cleanly against the `us`, `eu`, `jp`, `sh`, and `cn` versions. Note any version restrictions in the README entry if the patch only makes sense for a subset.
+  </Step>
+  <Step title="Open a pull request">
+    Push your branch to a fork of `n64decomp/sm64` on GitHub and open a pull request. Include:
+
+    - The `.patch` file in `enhancements/`
+    - Any companion files (`.js` scripts, binary assets) referenced by the patch
+    - The `enhancements/README.md` update
+    - A clear description of the feature and any emulator or hardware requirements
+  </Step>
+</Steps>
+
+<Tip>
+  Look at how `debug_box.patch` is structured as a reference. It adds two new files (`src/game/debug_box.c` and `src/game/debug_box.h`), modifies a single existing file (`src/game/area.c`) with minimal, focused changes, and includes thorough documentation in the new source files themselves.
+</Tip>

@@ -1,0 +1,499 @@
+---
+title: 'Sequence player: M64 music playback internals'
+description: 'Deep dive into SM64 sequence player structs, the M64 script interpreter, channel and layer processing, priority, tempo, reverb, and portamento.'
+---
+
+The sequence player is the heart of SM64's music system. It interprets binary M64 scripts — a compact, MIDI-inspired format — advancing each active channel and layer every audio frame. Understanding its data structures is the starting point for any modification to how music behaves in-game.
+
+## Three-level hierarchy
+
+Music playback is organised in three nested levels. Each level has its own script state (`M64ScriptState`), enabling independent looping and branching.
+
+```text
+SequencePlayer          (one per music slot — "Group" in debug symbols)
+  └─ SequenceChannel    (up to 16 per player — "SubTrack" in debug symbols)
+       └─ SequenceChannelLayer  (up to 4 per channel — "Track" in debug symbols)
+```
+
+<Note>
+  The internal debug names ("Group", "SubTrack", "Track") appear in the decompiled code's comments. The SM64 decomp project uses the Nintendo SDK names: `SequencePlayer`, `SequenceChannel`, and `SequenceChannelLayer`.
+</Note>
+
+Pools of channels and layers are pre-allocated globally:
+
+```c
+// from src/audio/load.h
+extern struct SequencePlayer  gSequencePlayers[SEQUENCE_PLAYERS];
+extern struct SequenceChannel gSequenceChannels[SEQUENCE_CHANNELS];
+extern struct SequenceChannelLayer gSequenceLayers[SEQUENCE_LAYERS];
+```
+
+Pool sizes vary by version (JP/US: 3 players, 32 channels, 52 layers; EU/SH: 4 players, 48 channels, 64 layers).
+
+---
+
+## `SequencePlayer` struct
+
+The top-level player tracks the global state of a music slot: which sequence is running, overall tempo and volume, fade state, and DMA progress for loading banks and sequence data from ROM.
+
+```c
+// from src/audio/internal.h
+struct SequencePlayer {
+    volatile u8 enabled : 1;
+    u8 finished : 1;        // never read
+    u8 muted : 1;
+    u8 seqDmaInProgress : 1;
+    u8 bankDmaInProgress : 1;
+    s8 seqVariation;        // set when SEQ_VARIATION bit is used
+    u8 state;               // SEQUENCE_PLAYER_STATE_* constants
+    u8 noteAllocPolicy;
+    u8 muteBehavior;        // MUTE_BEHAVIOR_* flags
+    u8 seqId;               // currently playing sequence ID
+    u8 defaultBank[1];
+    u8 loadingBankId;
+    u16 tempo;              // tatums per minute (beats per minute in JP)
+    u16 tempoAcc;           // accumulator for sub-frame tempo tracking
+    u16 fadeRemainingFrames;
+    s16 transposition;      // global semitone offset applied to all channels
+    u16 delay;
+    u8 *seqData;            // pointer into loaded sequence binary
+    f32 fadeVolume;         // current fade envelope value (starts at 1.0)
+    f32 fadeVelocity;       // per-frame delta applied to fadeVolume
+    f32 volume;             // master volume (starts at 0.0, set by sequence)
+    f32 muteVolumeScale;    // volume multiplier when muted (default 0.5)
+    struct SequenceChannel *channels[CHANNELS_MAX]; // up to 16 channels
+    struct M64ScriptState scriptState;
+    u8 *shortNoteVelocityTable;
+    u8 *shortNoteDurationTable;
+    struct NotePool notePool;
+    // DMA queues for async ROM loading
+    OSMesgQueue seqDmaMesgQueue;
+    OSMesgQueue bankDmaMesgQueue;
+    // ...
+}; // size = 0x140 (JP/US), 0x148 (EU), 0x14C (SH)
+```
+
+### Player states
+
+```c
+// from src/audio/internal.h
+#define SEQUENCE_PLAYER_STATE_0        0  // normal playback
+#define SEQUENCE_PLAYER_STATE_FADE_OUT 1  // fading out
+#define SEQUENCE_PLAYER_STATE_2        2
+#define SEQUENCE_PLAYER_STATE_3        3
+#define SEQUENCE_PLAYER_STATE_4        4
+```
+
+### Mute behaviour flags
+
+When a player is muted, `muteBehavior` controls what happens:
+
+```c
+#define MUTE_BEHAVIOR_STOP_SCRIPT 0x80 // stop processing sequence/channel scripts
+#define MUTE_BEHAVIOR_STOP_NOTES  0x40 // prevent further notes from playing
+#define MUTE_BEHAVIOR_SOFTEN      0x20 // lower volume, by default to half
+```
+
+---
+
+## `SequenceChannel` struct
+
+Each channel within a player has its own script cursor, instrument assignment, volume/pan/pitch controls, vibrato parameters, and a pool of up to four active layers.
+
+```c
+// from src/audio/internal.h
+struct SequenceChannel {
+    u8 enabled : 1;
+    u8 finished : 1;
+    u8 stopScript : 1;
+    u8 stopSomething2 : 1;  // propagates to SequenceChannelLayer.stopSomething
+    u8 hasInstrument : 1;
+    u8 stereoHeadsetEffects : 1;
+    u8 largeNotes : 1;      // notes specify duration and velocity explicitly
+    u8 unused : 1;
+    u8 noteAllocPolicy;
+    u8 muteBehavior;
+    u8 reverbVol;           // reverb send level (Q1.7 on JP/US, UQ0.8 on EU+)
+    u8 notePriority;        // 0–3, controls note stealing
+    u8 bankId;
+    u16 vibratoRateStart;   // initial vibrato rate (default 0x800)
+    u16 vibratoExtentStart;
+    u16 vibratoRateTarget;  // target vibrato rate (default 0x800)
+    u16 vibratoExtentTarget;
+    u16 vibratoRateChangeDelay;
+    u16 vibratoExtentChangeDelay;
+    u16 vibratoDelay;
+    u16 delay;
+    s16 instOrWave;         // 0 = none, 1+ = instrument index, 0x80-0x83 = synth wave
+    s16 transposition;      // semitone offset added to all note play commands
+    f32 volumeScale;
+    f32 volume;
+    f32 pan;                // 0.0 (left) to 1.0 (right) on JP/US
+    f32 panChannelWeight;   // proportion of channel pan vs. note pan
+    f32 freqScale;
+    u8 (*dynTable)[][2];
+    struct Instrument *instrument;
+    struct SequencePlayer *seqPlayer;
+    struct SequenceChannelLayer *layers[LAYERS_MAX]; // up to 4 layers
+    s8 soundScriptIO[8];    // I/O bridge to sound script (player 2)
+    struct M64ScriptState scriptState;
+    struct AdsrSettings adsr;
+    struct NotePool notePool;
+}; // size = 0xC0 (JP/US), 0xC4 (EU), 0xD0 (SH)
+```
+
+<Tip>
+  `instOrWave` values `0x80`–`0x83` select a synthetic waveform (sawtooth, triangle, sine, square) instead of a sampled instrument. This is used for simple tones without needing sample ROM data.
+</Tip>
+
+### Note priority
+
+```c
+#define NOTE_PRIORITY_DISABLED  0
+#define NOTE_PRIORITY_STOPPING  1
+#define NOTE_PRIORITY_MIN       2
+#define NOTE_PRIORITY_DEFAULT   3
+```
+
+When all polyphonic note slots are occupied and a new note needs to play, the engine looks for the slot with the lowest `priority` value to steal. A channel's `notePriority` seeds newly triggered notes.
+
+---
+
+## `SequenceChannelLayer` struct
+
+A layer is the finest-grained script unit — it handles individual note events on behalf of its parent channel. Up to four layers per channel can be active simultaneously, allowing a single channel to play chords or overlapping notes.
+
+```c
+// from src/audio/internal.h
+struct SequenceChannelLayer {
+    u8 enabled : 1;
+    u8 finished : 1;
+    u8 stopSomething : 1;
+    u8 continuousNotes : 1;  // reuse same Note object for consecutive same-pitch notes
+    u8 status;               // load status of the current sound
+    u8 noteDuration;         // default note duration (initialised to 0x80)
+    u8 portamentoTargetNote;
+    struct Portamento portamento;
+    struct AdsrSettings adsr;
+    u16 portamentoTime;
+    s16 transposition;       // semitone offset added to play commands (extends range to 0x40–0x7F)
+    f32 freqScale;
+    f32 velocitySquare;
+    f32 pan;                 // 0.0–1.0 (JP/US); 0–128 integer on EU+
+    f32 noteVelocity;
+    f32 notePan;
+    f32 noteFreqScale;
+    s16 shortNoteDefaultPlayPercentage;
+    s16 playPercentage;
+    s16 delay;
+    s16 duration;
+    struct Note *note;
+    struct Instrument *instrument;
+    struct AudioBankSound *sound;
+    struct SequenceChannel *seqChannel;
+    struct M64ScriptState scriptState;
+    struct AudioListItem listItem;
+}; // size = 0x80
+```
+
+Layers are allocated from a free-list (`gLayerFreeList`) via `seq_channel_set_layer()` and returned on note completion:
+
+```c
+// from src/audio/seqplayer.c
+s32 seq_channel_set_layer(struct SequenceChannel *seqChannel, s32 layerIndex) {
+    struct SequenceChannelLayer *layer;
+
+    if (seqChannel->layers[layerIndex] == NULL) {
+        layer = audio_list_pop_back(&gLayerFreeList);
+        seqChannel->layers[layerIndex] = layer;
+        if (layer == NULL) {
+            seqChannel->layers[layerIndex] = NULL;
+            return -1;
+        }
+    } else {
+        seq_channel_layer_note_decay(seqChannel->layers[layerIndex]);
+    }
+    // ... initialise layer fields
+}
+```
+
+---
+
+## Script processing functions
+
+The sequence player advances all active scripts on every call to `process_sequences()`.
+
+<Steps>
+  <Step title="process_sequences()">
+    Called from the audio frame task loop. Iterates over all enabled `SequencePlayer` slots.
+
+    ```c
+    // declared in src/audio/seqplayer.h
+    void process_sequences(s32 iterationsRemaining);
+    ```
+  </Step>
+  <Step title="sequence_channel_process_script()">
+    Runs the M64 interpreter for one channel. Reads opcode bytes from `scriptState.pc`, handles control flow (jumps, loops, calls), and dispatches note events to layers.
+
+    ```c
+    // declared in src/audio/seqplayer.c
+    void sequence_channel_process_script(struct SequenceChannel *seqChannel);
+    ```
+  </Step>
+  <Step title="seq_channel_layer_process_script()">
+    Runs the per-layer script. Advances the note delay counter, and when it reaches zero, emits a note to the synthesis pipeline and looks up the instrument/sample.
+
+    ```c
+    // declared in src/audio/seqplayer.c
+    void seq_channel_layer_process_script(struct SequenceChannelLayer *layer);
+    ```
+
+    On Shindou this function is split into five sub-parts to work around compiler limitations:
+
+    ```c
+    // Shindou/CN only (src/audio/seqplayer.c)
+    void seq_channel_layer_process_script_part1(struct SequenceChannelLayer *layer);
+    s32  seq_channel_layer_process_script_part2(struct SequenceChannelLayer *layer);
+    s32  seq_channel_layer_process_script_part3(struct SequenceChannelLayer *layer, s32 cmd);
+    s32  seq_channel_layer_process_script_part4(struct SequenceChannelLayer *layer, s32 cmd);
+    s32  seq_channel_layer_process_script_part5(struct SequenceChannelLayer *layer, s32 cmd);
+    ```
+  </Step>
+  <Step title="get_instrument()">
+    Resolves an instrument index for a channel, writing the result and ADSR settings to output pointers. Returns `TRUE` if the instrument was found and loaded.
+
+    ```c
+    u8 get_instrument(struct SequenceChannel *seqChannel, u8 instId,
+                      struct Instrument **instOut, struct AdsrSettings *adsr);
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Priority system for background music
+
+SM64 uses a priority queue (`MAX_BACKGROUND_MUSIC_QUEUE_SIZE = 6`) to manage concurrent music requests. Each request carries a priority byte packed into the `seqArgs` word via `SEQUENCE_ARGS`:
+
+```c
+// from src/audio/external.h
+#define SEQUENCE_ARGS(priority, seqId) ((priority << 8) | seqId)
+
+// Usage:
+play_music(SEQ_PLAYER_LEVEL, SEQUENCE_ARGS(1, SEQ_LEVEL_GRASS), 0);
+```
+
+When a higher-priority sequence is requested, it can displace the current one. The displaced sequence is saved in the queue so it resumes when the higher-priority music ends. `drop_queued_background_music()` discards the front of this queue.
+
+<Warning>
+  The queue holds up to 6 items (`MAX_BACKGROUND_MUSIC_QUEUE_SIZE`). Overflowing this limit causes the oldest entry to be silently discarded.
+</Warning>
+
+---
+
+## Tempo and timing
+
+Tempo is stored in the `SequencePlayer` as tatums (sub-beats) per minute on US/EU, or beats per minute on JP:
+
+```c
+/*0x00A*/ u16 tempo;    // tatums/min on US/EU, BPM on JP
+/*0x00C*/ u16 tempoAcc; // fractional accumulator for sub-frame timing
+```
+
+The constant `TATUMS_PER_BEAT = 48` defines the resolution. Each audio frame the accumulator is advanced by `tempo`; when it overflows, a tatum tick is consumed and the script advances. This gives smooth tempo handling without integer rounding.
+
+A global scaling factor converts internal tempo representation to external BPM:
+
+```c
+// from src/audio/load.h
+extern s16 gTempoInternalToExternal;
+```
+
+The Shindou version adds `tempoAdd` (`s16`) for real-time tempo modulation in sequence scripts.
+
+---
+
+## Volume and transposition
+
+Volume is a three-way product resolved at synthesis time:
+
+```text
+final_volume = player.fadeVolume × player.volume × channel.volume × channel.volumeScale
+```
+
+`fadeVolume` approaches its target at rate `fadeVelocity` per frame; both are `f32` fields on `SequencePlayer`. `muteVolumeScale` (default `0.5f`) is applied when the player's `muted` flag is set.
+
+Transposition is additive in semitones across all three levels:
+
+```text
+effective_pitch = player.transposition + channel.transposition + layer.transposition
+```
+
+Layer transposition extends the M64 note range from 0–63 to 0–127 by adding 64 (`0x40`) to reach notes that the 6-bit note field cannot directly encode.
+
+---
+
+## Portamento
+
+Pitch sliding is implemented in `SequenceChannelLayer` and `Note` via the `Portamento` struct:
+
+```c
+// from src/audio/internal.h
+// Pitch sliding by up to one octave in the positive direction.
+struct Portamento {
+    u8  mode;   // bit 0x80 = special mode; low bits = mode index 0-5
+    f32 cur;    // current pitch scale factor
+    f32 speed;  // per-frame delta
+    f32 extent; // total slide range
+}; // size = 0x10
+```
+
+Five portamento modes (`PORTAMENTO_MODE_1` through `PORTAMENTO_MODE_5`) control whether the slide applies at note start, end, or across the full duration. The `PORTAMENTO_IS_SPECIAL` macro tests the high bit:
+
+```c
+#define PORTAMENTO_IS_SPECIAL(x) ((x).mode & 0x80)
+#define PORTAMENTO_MODE(x)       ((x).mode & ~0x80)
+```
+
+Negative `extent` is accepted but produces exponential extrapolation in the wrong direction — a known quirk documented in the source comments.
+
+---
+
+## Vibrato
+
+Vibrato state is tracked per-note in `VibratoState` and driven by the parameters set on `SequenceChannel`:
+
+```c
+// from src/audio/internal.h
+struct VibratoState {
+    struct SequenceChannel *seqChannel;
+    u32  time;
+    s8  *curve;             // pointer into gVibratoCurve[16]
+    u8   active;
+    u16  rate;
+    u16  extent;
+    u16  rateChangeTimer;
+    u16  extentChangeTimer;
+    u16  delay;             // frames before vibrato starts
+}; // size = 0x18
+```
+
+The curve data (`gVibratoCurve` from `data.h`) provides the waveform shape. Rate and extent can ramp smoothly between start and target values over `vibratoRateChangeDelay` / `vibratoExtentChangeDelay` frames.
+
+---
+
+## Reverb system
+
+Reverb is implemented as a ring-buffer delay line in the synthesis pipeline, configured per session via `SynthesisReverb`. On JP/US there is one global reverb unit; EU and later add up to four independent units.
+
+```c
+// from src/audio/synthesis.h
+struct SynthesisReverb {
+    u8  resampleFlags;
+    u8  useReverb;
+    u8  framesLeftToIgnore;
+    u8  curFrame;
+    u16 reverbGain;         // feedback gain for the ring buffer
+    u16 resampleRate;       // downsampling rate for the reverb path
+    s32 nextRingBufferPos;
+    s32 bufSizePerChannel;  // ring buffer length in samples
+    struct {
+        s16 *left;
+        s16 *right;
+    } ringBuffer;
+    s16 *resampleStateLeft;
+    s16 *resampleStateRight;
+    struct ReverbRingBufferItem items[2][MAX_UPDATES_PER_FRAME];
+}; // 0xCC <= size <= 0x100
+```
+
+Each channel's `reverbVol` field sets the wet-send level for that channel. The ring buffer item list (`items`) stores the per-update write positions so the RSP microcode can accumulate reverb asynchronously across multiple updates within one audio frame.
+
+```c
+// from src/audio/synthesis.h
+struct ReverbRingBufferItem {
+    s16  numSamplesAfterDownsampling;
+    s16  chunkLen;
+    s16 *toDownsampleLeft;
+    s16 *toDownsampleRight;
+    s32  startPos;    // write start position in ring buffer
+    s16  lengthA;     // bytes until end of ring buffer from startPos
+    s16  lengthB;     // bytes written from position 0 (wrap-around)
+}; // size = 0x14
+```
+
+<Note>
+  `SOUND_NO_ECHO` (`0x20`) in a sound's lower bitflags suppresses level reverb for that sound entirely. This is used for sounds that would sound wrong with the room reverb applied, such as UI sounds.
+</Note>
+
+---
+
+## ADSR envelope
+
+Each note plays through a four-stage amplitude envelope defined by an array of `AdsrEnvelope` entries:
+
+```c
+// from src/audio/internal.h
+struct AdsrEnvelope {
+    s16 delay; // duration in ticks (or special command)
+    s16 arg;   // target level or command argument
+}; // size = 0x4
+
+struct AdsrSettings {
+    u8 releaseRate;
+    u16 sustain;                // sustain level, 2^16 = max (JP/US)
+    struct AdsrEnvelope *envelope;
+}; // size = 0x8
+```
+
+`AdsrSettings` is inherited from player → channel → layer, with the layer having the final say. The runtime state machine that advances through the envelope lives in `AdsrState` on the `Note` struct.
+
+---
+
+## Initialisation
+
+```c
+// from src/audio/seqplayer.h
+void init_sequence_player(u32 player);   // reset one player slot
+void init_sequence_players(void);        // reset all player slots
+```
+
+`sequence_channel_init()` (defined in `seqplayer.c`) zeroes all channel fields and resets vibrato, ADSR, and volume to their defaults. It is called both during initial setup and whenever a channel is re-used for a new sequence.
+
+---
+
+## AudioListItem and note pools
+
+Layers and notes are tracked through an intrusive circularly linked list, `AudioListItem`, that avoids dynamic memory allocation:
+
+```c
+// from src/audio/internal.h
+struct AudioListItem {
+    struct AudioListItem *prev;
+    struct AudioListItem *next;
+    union {
+        void *value; // Note* or SequenceChannelLayer*
+        s32   count; // used in list heads
+    } u;
+    struct NotePool *pool;
+}; // size = 0x10
+```
+
+Note pools have four sub-lists corresponding to note lifecycle states:
+
+```c
+struct NotePool {
+    struct AudioListItem disabled;
+    struct AudioListItem decaying;
+    struct AudioListItem releasing;
+    struct AudioListItem active;
+};
+```
+
+```c
+// from src/audio/seqplayer.h
+void audio_list_push_back(struct AudioListItem *list, struct AudioListItem *item);
+void *audio_list_pop_back(struct AudioListItem *list);
+```
+
+When a note is stolen for reuse, it moves from `active` through `releasing` and `decaying` before returning to the global free pool. Layers similarly move through `gLayerFreeList`.

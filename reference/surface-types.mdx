@@ -1,0 +1,380 @@
+---
+title: "Surface types and terrain constants in SM64"
+description: "Reference for SURFACE_* and TERRAIN_* constants, the Surface struct layout, surface flags, and the collision data macros used to define level geometry in SM64."
+---
+
+Every triangle in SM64's collision mesh carries a surface type — a 16-bit constant that tells the engine how Mario should interact with it. Surface types control friction, whether a floor is lethal, whether it warps Mario to another area, which camera behaviour to activate, and much more. This page documents all constants defined in `include/surface_terrains.h`, the `struct Surface` layout, the terrain-sound system, and the macros used to build raw collision data in level geometry files.
+
+## struct Surface
+
+Defined in `include/types.h`, this struct describes a single collision triangle at runtime.
+
+```c
+struct Surface {
+    /*0x00*/ TerrainData type;       // surface type constant (SURFACE_*)
+    /*0x02*/ TerrainData force;      // parameter for some surface types
+    /*0x04*/ s8         flags;       // SURFACE_FLAG_* bitmask
+    /*0x05*/ RoomData   room;        // room index (-128..127)
+    /*0x06*/ TerrainData lowerY;     // bounding box lower Y
+    /*0x08*/ TerrainData upperY;     // bounding box upper Y
+    /*0x0A*/ Vec3Terrain vertex1;    // first triangle vertex (s16[3])
+    /*0x10*/ Vec3Terrain vertex2;
+    /*0x16*/ Vec3Terrain vertex3;
+    /*0x1C*/ struct { f32 x; f32 y; f32 z; } normal; // face normal (unit)
+    /*0x28*/ f32        originOffset; // plane equation: dot(normal, P) + originOffset = 0
+    /*0x2C*/ struct Object *object;   // non-null if this is a dynamic (moving) surface
+};
+```
+
+<ResponseField name="type" type="TerrainData (s16)">
+  The primary surface type. One of the `SURFACE_*` constants listed below. Determines floor/wall/ceiling behavior, friction class, special effects, and camera mode.
+</ResponseField>
+
+<ResponseField name="force" type="TerrainData (s16)">
+  An auxiliary data word whose meaning depends on `type`. Used by flowing water, horizontal wind, instant-warp surfaces, and certain camera surfaces to carry directional or warp-target data.
+</ResponseField>
+
+<ResponseField name="flags" type="s8 — SURFACE_FLAG_* bitmask">
+  | Constant | Value | Meaning |
+  |----------|-------|---------|
+  | `SURFACE_FLAG_DYNAMIC`          | `0x01` | Triangle belongs to a moving object |
+  | `SURFACE_FLAG_NO_CAM_COLLISION` | `0x02` | Camera passes through this surface |
+  | `SURFACE_FLAG_X_PROJECTION`     | `0x08` | Use X-axis projection for wall normals |
+</ResponseField>
+
+<ResponseField name="room" type="RoomData (s8)">
+  The area room index. Objects and Mario are culled from rooms they are not in, enabling BBH and similar interiors to have separate object sets.
+</ResponseField>
+
+<ResponseField name="normal / originOffset" type="f32">
+  The precomputed unit normal and the plane equation constant. These are filled in by `load_area_terrain` at level-load time and used by the collision queries (`find_floor`, `find_ceil`, `find_wall_collisions`).
+</ResponseField>
+
+## Surface type constants
+
+### Standard floors and friction classes
+
+<ResponseField name="SURFACE_DEFAULT" type="0x0000">
+  The default floor. Uses the level's ambient terrain sound type set by the `terrain_type` script command. Standard friction.
+</ResponseField>
+
+<ResponseField name="SURFACE_BURNING" type="0x0001">
+  Lava (and frostbite in SSL/SL). Landing on this surface deals continuous damage and triggers the burning animation. The surface type is reused for both lava and freezing surfaces depending on level context.
+</ResponseField>
+
+<ResponseField name="SURFACE_HANGABLE" type="0x0005">
+  Ceiling that Mario can grab onto and traverse using the hanging locomotion (used in HMC, CotMC, and similar cave ceilings).
+</ResponseField>
+
+<ResponseField name="SURFACE_SLOW" type="0x0009">
+  Slows Mario's movement. Defined but effectively unused in the final game.
+</ResponseField>
+
+<ResponseField name="SURFACE_DEATH_PLANE" type="0x000A">
+  Instant kill floor. Mario dies immediately on contact. Used at the bottom of out-of-bounds pits.
+</ResponseField>
+
+<ResponseField name="SURFACE_VERY_SLIPPERY" type="0x0013">
+  Equivalent to `SURFACE_CLASS_VERY_SLIPPERY`. Very high slide friction — Mario slides freely and cannot walk. Used for icy slides and some PSS sections.
+</ResponseField>
+
+<ResponseField name="SURFACE_SLIPPERY" type="0x0014">
+  Equivalent to `SURFACE_CLASS_SLIPPERY`. Moderate sliding; Mario moves with reduced traction. Used on ice patches.
+</ResponseField>
+
+<ResponseField name="SURFACE_NOT_SLIPPERY" type="0x0015">
+  Equivalent to `SURFACE_CLASS_NOT_SLIPPERY`. Maximum grip. Mario cannot slide at all — used on rough surfaces and climbable walls.
+</ResponseField>
+
+<ResponseField name="SURFACE_HARD" type="0x0030">
+  Mario always takes fall damage when landing on this surface, regardless of fall distance. Used on metal/stone platforms.
+</ResponseField>
+
+<ResponseField name="SURFACE_HARD_SLIPPERY" type="0x0035">
+  Hard + slippery. Always deals fall damage and provides reduced traction.
+</ResponseField>
+
+<ResponseField name="SURFACE_HARD_VERY_SLIPPERY" type="0x0036">
+  Hard + very slippery. Always deals fall damage and provides minimal traction.
+</ResponseField>
+
+<ResponseField name="SURFACE_HARD_NOT_SLIPPERY" type="0x0037">
+  Hard + maximum grip. Always deals fall damage but Mario cannot slide.
+</ResponseField>
+
+<ResponseField name="SURFACE_ICE" type="0x002E">
+  Very slippery ice floor. Used in snow levels (CCM, SL) and THI's underwater floor. Similar to `SURFACE_VERY_SLIPPERY` in effect.
+</ResponseField>
+
+### Water and quicksand
+
+<ResponseField name="SURFACE_WATER" type="0x000D">
+  Marks a water volume surface. Used on some waterboxes but has no associated movement action; the waterbox system handles swimming separately.
+</ResponseField>
+
+<ResponseField name="SURFACE_FLOWING_WATER" type="0x000E">
+  Water with a directional current. The `force` field encodes the flow direction and speed.
+</ResponseField>
+
+<ResponseField name="SURFACE_SHALLOW_QUICKSAND" type="0x0021">
+  Quicksand with a depth of 10 units. Mario slowly sinks but can escape.
+</ResponseField>
+
+<ResponseField name="SURFACE_DEEP_QUICKSAND" type="0x0022">
+  Lethal quicksand 160 units deep. Mario sinks slowly but dies if fully submerged.
+</ResponseField>
+
+<ResponseField name="SURFACE_INSTANT_QUICKSAND" type="0x0023">
+  Instantly lethal quicksand. Mario dies on first contact.
+</ResponseField>
+
+<ResponseField name="SURFACE_DEEP_MOVING_QUICKSAND" type="0x0024">
+  Flowing quicksand, 160 units deep. The `force` field provides the current direction.
+</ResponseField>
+
+<ResponseField name="SURFACE_SHALLOW_MOVING_QUICKSAND" type="0x0025">
+  Flowing quicksand, 25 units deep.
+</ResponseField>
+
+<ResponseField name="SURFACE_QUICKSAND" type="0x0026">
+  Moving quicksand, 60 units deep.
+</ResponseField>
+
+<ResponseField name="SURFACE_MOVING_QUICKSAND" type="0x0027">
+  Flowing quicksand, 60 units deep (primary SSL desert variant).
+</ResponseField>
+
+<ResponseField name="SURFACE_INSTANT_MOVING_QUICKSAND" type="0x002D">
+  Instantly lethal flowing quicksand. Not included in the `SURFACE_IS_QUICKSAND` range check.
+</ResponseField>
+
+The helper macro `SURFACE_IS_QUICKSAND(cmd)` returns true for types `0x21`–`0x27` (excludes `SURFACE_INSTANT_MOVING_QUICKSAND`).
+
+### Wind
+
+<ResponseField name="SURFACE_HORIZONTAL_WIND" type="0x002C">
+  Applies a horizontal push force to Mario. The `force` field encodes the wind direction (yaw angle). Used on SL's snow plains and the wind corridors in SSL.
+</ResponseField>
+
+<ResponseField name="SURFACE_VERTICAL_WIND" type="0x0038">
+  Upward wind combined with a death plane at the bottom. Used in the spiral staircase area to push Mario up. Mario dies if he falls below the associated death boundary.
+</ResponseField>
+
+### Warp surfaces
+
+<ResponseField name="SURFACE_INSTANT_WARP_1B / _1C / _1D / _1E" type="0x001B–0x001E">
+  Stepping on one of these triggers an immediate area warp. The `force` field identifies the warp destination. Used in WDW (between the two water level areas), DDD, SSL, TTM, and the endless stairs (to warp back when Mario lacks enough stars).
+</ResponseField>
+
+<ResponseField name="SURFACE_WARP" type="0x0032">
+  Generic warp surface.
+</ResponseField>
+
+<ResponseField name="SURFACE_LOOK_UP_WARP" type="0x002F">
+  Warps Mario when he looks up while standing on it. Used for the Wing Cap entrance (the castle's central room).
+</ResponseField>
+
+<ResponseField name="SURFACE_WOBBLING_WARP" type="0x00FD">
+  Pool warp used in HMC and DDD.
+</ResponseField>
+
+### Timer surfaces
+
+<ResponseField name="SURFACE_TIMER_START" type="0x0033">
+  Starts the in-game slide timer. Used at the beginning of Peach's Secret Slide.
+</ResponseField>
+
+<ResponseField name="SURFACE_TIMER_END" type="0x0034">
+  Stops the timer and awards the star if the time is good enough.
+</ResponseField>
+
+### Camera-control surfaces
+
+Camera surfaces are intangible to Mario but change the camera behaviour when he enters their volume.
+
+| Constant | Value | Effect |
+|----------|-------|--------|
+| `SURFACE_CLOSE_CAMERA`         | `0x000B` | Pulls the camera close to Mario |
+| `SURFACE_BOSS_FIGHT_CAMERA`    | `0x0065` | Wide fixed camera for BoB and WF boss fights |
+| `SURFACE_CAMERA_FREE_ROAM`     | `0x0066` | Free-roam camera (THI, TTC) |
+| `SURFACE_CAMERA_8_DIR`         | `0x0069` | Far camera for platforms (THI) |
+| `SURFACE_CAMERA_MIDDLE`        | `0x006E` | Returns camera to the middle (SSL pillars) |
+| `SURFACE_CAMERA_ROTATE_RIGHT`  | `0x006F` | Camera rotates right (Bowser 1, THI) |
+| `SURFACE_CAMERA_ROTATE_LEFT`   | `0x0070` | Camera rotates left (BoB, TTM) |
+| `SURFACE_CAMERA_BOUNDARY`      | `0x0072` | Invisible camera movement limiter |
+| `SURFACE_NO_CAM_COLLISION`     | `0x0076` | No camera collision |
+
+### Misc special surfaces
+
+<ResponseField name="SURFACE_INTANGIBLE" type="0x0012">
+  An invisible separation barrier. Used in BBH to isolate the mansion interior from the merry-go-round exterior for room purposes. Mario passes through it.
+</ResponseField>
+
+<ResponseField name="SURFACE_MGR_MUSIC" type="0x001A">
+  Triggers the Merry-Go-Round music to play when Mario is standing on it. Handled by `handle_merry_go_round_music` in `bbh_merry_go_round.inc.c`.
+</ResponseField>
+
+<ResponseField name="SURFACE_WALL_MISC" type="0x0028">
+  Generic wall used for some interactive walls (Warp Pipe, Cannon barrel). Also adjusts camera framing.
+</ResponseField>
+
+<ResponseField name="SURFACE_SWITCH" type="0x007A">
+  Non-slippery surface with no camera collision, used by floor switches and Dorrie.
+</ResponseField>
+
+<ResponseField name="SURFACE_VANISH_CAP_WALLS" type="0x007B">
+  Walls that can be passed through while wearing the Vanish Cap.
+</ResponseField>
+
+<ResponseField name="SURFACE_TTM_VINES" type="0x0016">
+  TTM vine surface — currently has no action defined.
+</ResponseField>
+
+<ResponseField name="SURFACE_TRAPDOOR" type="0x00FF">
+  Bowser arena left trapdoor. Has no action defined.
+</ResponseField>
+
+### Painting surfaces
+
+Surfaces in the range `0x00A6`–`0x00D2` cause the corresponding painting in the castle lobby to wobble when Mario touches them. Surfaces in `0x00D3`–`0x00FC` warp Mario into the corresponding level painting.
+
+```c
+#define SURFACE_IS_PAINTING_WARP(cmd) (cmd >= 0xD3 && cmd < 0xFD)
+```
+
+Selected examples:
+
+| Constant | Value | Level |
+|----------|-------|-------|
+| `SURFACE_PAINTING_WOBBLE_A6` | `0x00A6` | BoB painting (left zone) |
+| `SURFACE_PAINTING_WARP_D3`   | `0x00D3` | BoB painting warp (left) |
+| `SURFACE_PAINTING_WARP_D9`   | `0x00D9` | WF painting warp (left) |
+| `SURFACE_PAINTING_WARP_DF`   | `0x00DF` | LLL painting warp (left) |
+| `SURFACE_TTC_PAINTING_1`     | `0x00F4` | TTC painting warp (left) |
+
+## Surface class constants
+
+The engine reduces any surface type to one of four friction classes for movement calculations:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `SURFACE_CLASS_DEFAULT`       | `0x0000` | Standard traction |
+| `SURFACE_CLASS_VERY_SLIPPERY` | `0x0013` | Near-zero traction (slides) |
+| `SURFACE_CLASS_SLIPPERY`      | `0x0014` | Reduced traction |
+| `SURFACE_CLASS_NOT_SLIPPERY`  | `0x0015` | Maximum traction |
+
+The check `SURFACE_IS_NOT_HARD(cmd)` returns true for all surfaces that do **not** always cause fall damage (i.e., excludes `SURFACE_HARD` and `0x35`–`0x37`).
+
+## Terrain sound types
+
+The level script command `terrain_type` sets the ambient terrain for an area. This controls the footstep sound effects Mario produces. The constant is stored in the level's area data and accessed via `MarioState.terrainSoundAddend`.
+
+| Constant | Value | Sound effect theme |
+|----------|-------|-------------------|
+| `TERRAIN_GRASS`  | `0x0000` | Grass / dirt |
+| `TERRAIN_STONE`  | `0x0001` | Stone / concrete |
+| `TERRAIN_SNOW`   | `0x0002` | Snow |
+| `TERRAIN_SAND`   | `0x0003` | Sand |
+| `TERRAIN_SPOOKY` | `0x0004` | Haunted house (quieter, creaky) |
+| `TERRAIN_WATER`  | `0x0005` | Splashing |
+| `TERRAIN_SLIDE`  | `0x0006` | Slide surface |
+
+`TERRAIN_MASK = 0x0007` masks out the 3-bit terrain index from the combined sound addend.
+
+## Collision data format and macros
+
+Raw collision data for level geometry is stored as `Collision` (`s16`) arrays. `include/surface_terrains.h` defines convenience macros that make these arrays readable:
+
+```c
+// Begin a collision data block
+COL_INIT()
+
+// Declare N vertices
+COL_VERTEX_INIT(vtxNum)
+
+// Individual vertex
+COL_VERTEX(x, y, z)
+
+// Begin a group of triangles with a given surface type
+COL_TRI_INIT(surfType, triNum)
+
+// A triangle referencing three vertex indices
+COL_TRI(v1, v2, v3)
+
+// A triangle with an extra force parameter (flowing water, wind, etc.)
+COL_TRI_SPECIAL(v1, v2, v3, param)
+
+// Stop reading triangles for this group (continue to next group)
+COL_TRI_STOP()
+
+// End the entire collision block
+COL_END()
+```
+
+A minimal example from a level geometry file:
+
+```c
+static const Collision my_platform_collision[] = {
+    COL_INIT(),
+    COL_VERTEX_INIT(4),
+        COL_VERTEX(-200,   0, -200),
+        COL_VERTEX( 200,   0, -200),
+        COL_VERTEX( 200,   0,  200),
+        COL_VERTEX(-200,   0,  200),
+    COL_TRI_INIT(SURFACE_DEFAULT, 2),
+        COL_TRI(0, 1, 2),
+        COL_TRI(0, 2, 3),
+    COL_TRI_STOP(),
+    COL_END(),
+};
+```
+
+<Note>
+  All vertex coordinates are `s16` — they are limited to **−32768 … 32767** world units. If your geometry requires larger coordinates, scale the model down or consider splitting collision into multiple pieces.
+</Note>
+
+### Water box macros
+
+Water bodies are declared at the end of a collision block using the environment loader:
+
+```c
+COL_WATER_BOX_INIT(num)      // declare num water boxes follow
+COL_WATER_BOX(id, x1, z1, x2, z2, y)  // axis-aligned water box
+```
+
+### TERRAIN_LOAD_* commands
+
+These commands are embedded in the collision data stream itself and are processed by the collision loader, not the physics engine:
+
+| Constant | Value | Role |
+|----------|-------|------|
+| `TERRAIN_LOAD_VERTICES`    | `0x0040` | Begin vertex list |
+| `TERRAIN_LOAD_CONTINUE`    | `0x0041` | End triangle group, continue stream |
+| `TERRAIN_LOAD_END`         | `0x0042` | End the entire collision block |
+| `TERRAIN_LOAD_OBJECTS`     | `0x0043` | Load macro objects placed in this area |
+| `TERRAIN_LOAD_ENVIRONMENT` | `0x0044` | Load water/gas environment boxes |
+
+`TERRAIN_LOAD_IS_SURFACE_TYPE_LOW(cmd)` is true for commands `< 0x40` (real surface types), and `TERRAIN_LOAD_IS_SURFACE_TYPE_HIGH(cmd)` is true for `>= 0x65` (camera surfaces and painting types).
+
+## How surface type affects Mario's movement
+
+<AccordionGroup>
+  <Accordion title="Floor friction / sliding">
+    The engine maps every `type` to a surface class (`SURFACE_CLASS_*`). If the class is `VERY_SLIPPERY` or `SLIPPERY`, Mario's action is set to a sliding action rather than walking. The magnitude of slide deceleration is controlled by the class: very slippery surfaces decelerate very slowly, allowing long slides.
+  </Accordion>
+  <Accordion title="Fall damage">
+    `SURFACE_HARD` and `0x35`–`0x37` always trigger the fall-damage animation and sound regardless of fall height. On all other surfaces, fall damage only occurs when Mario's fall speed exceeds the threshold.
+  </Accordion>
+  <Accordion title="Lava damage">
+    `SURFACE_BURNING` is detected by `mario_floor_is_lava()`. Mario takes periodic damage and is launched upward. The burning-feet animation plays and a timer gates how frequently damage is applied.
+  </Accordion>
+  <Accordion title="Quicksand sinking">
+    Any type for which `SURFACE_IS_QUICKSAND(type)` is true initiates a sinking sub-action. The depth variant determines how far Mario sinks and whether it is instantly lethal.
+  </Accordion>
+  <Accordion title="Wind and water current">
+    `SURFACE_HORIZONTAL_WIND`, `SURFACE_FLOWING_WATER`, and the moving quicksand types all use the `force` field of `struct Surface` to supply a direction. The physics engine reads this after resolving the floor triangle.
+  </Accordion>
+  <Accordion title="Terrain footstep sounds">
+    The area-wide `TERRAIN_*` constant is blended with certain surface-specific overrides. For example, `SURFACE_NOISE_DEFAULT` and `SURFACE_NOISE_SLIPPERY` add noise to the default footstep sample.
+  </Accordion>
+</AccordionGroup>

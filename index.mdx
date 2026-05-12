@@ -1,133 +1,85 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "Super Mario 64 Decompilation"
+description: "A complete, byte-for-byte matching decompilation of Super Mario 64 for the Nintendo 64 — study, mod, and port the classic 3D platformer at the source level."
 ---
 
-## Setting up
+The SM64 decompilation is a fully matching recreation of the Super Mario 64 source code in C, produced by reverse-engineering the original N64 ROM. Every function, struct, and data table has been reconstructed so the compiled output is bit-identical to the shipped cartridge. The codebase covers all five regional versions: US, JP, EU, Shindou, and iQue Player.
 
-Get your documentation site up and running in minutes.
+Whether you're here to understand how a classic 3D game works, build a ROM hack, or port the game to a new platform, this documentation covers everything from setting up your build environment to diving deep into the game's physics, object behavior, and audio systems.
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/introduction">
+    Get prerequisites installed and build your first ROM in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Project Structure" icon="folder-tree" href="/project-structure">
+    Understand how the source tree is organized before diving in
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Game Systems" icon="gamepad" href="/systems/mario-state">
+    Explore Mario's physics, object behaviors, rendering, and audio
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Modding Guide" icon="wrench" href="/modding/enhancements">
+    Apply enhancement patches and create your own modifications
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Build your ROM in four steps
 
-Everything you need to create world-class documentation.
+<Steps>
+  <Step title="Install prerequisites">
+    Install the MIPS cross-compiler toolchain and Python 3.6+. On Ubuntu/Debian:
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+    ```bash
+    sudo apt install -y binutils-mips-linux-gnu build-essential git pkgconf python3
+    ```
+  </Step>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/n64decomp/sm64.git
+    cd sm64
+    ```
+  </Step>
+  <Step title="Place your baserom">
+    Copy a legally obtained Super Mario 64 ROM into the project root. The file must be named according to the region you want to build:
 
-## Make your content agent ready
+    ```
+    baserom.us.z64   # North America
+    baserom.jp.z64   # Japan
+    baserom.eu.z64   # Europe
+    ```
+  </Step>
+  <Step title="Build">
+    ```bash
+    make             # defaults to VERSION=us
+    make VERSION=jp -j4   # build Japan version with 4 parallel jobs
+    ```
 
-Make your docs work for humans and AI agents alike.
+    The compiled ROM appears in the `build/` directory.
+  </Step>
+</Steps>
 
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
+## Explore the codebase
 
-## Need inspiration?
+<CardGroup cols={3}>
+  <Card title="Mario & Physics" icon="person-running" href="/systems/mario-state">
+    MarioState struct, action system, and movement physics
+  </Card>
+  <Card title="Object Behaviors" icon="robot" href="/systems/objects">
+    Generic object model and behavior scripting language
+  </Card>
+  <Card title="Collision" icon="shield" href="/systems/collision">
+    Surface detection, floor/wall/ceiling raycasting
+  </Card>
+  <Card title="Geo Layout" icon="bezier-curve" href="/systems/geo-layout">
+    Scene graph and rendering hierarchy description
+  </Card>
+  <Card title="Level Scripts" icon="layer-group" href="/systems/level-scripts">
+    Level loading, area initialization, and warp system
+  </Card>
+  <Card title="Audio Engine" icon="music" href="/systems/audio-overview">
+    Sequence player, sound synthesis, and bank loading
+  </Card>
+</CardGroup>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Note>
+  This repository does not include game assets. You must own a copy of Super Mario 64 to extract the assets needed for compilation.
+</Note>

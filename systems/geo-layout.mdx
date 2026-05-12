@@ -1,0 +1,455 @@
+---
+title: "Geo layout: scene graph for SM64 rendering"
+description: "How SM64 builds its rendering scene graph from arrays of uintptr_t geo commands, the GraphNode hierarchy, drawing layers, and real actor examples."
+---
+
+The geo layout system is SM64's mechanism for describing the 3-D scene graph used during rendering. Every level area, actor, and UI element is represented as a tree of **GraphNode** structures. That tree is built at load time by interpreting a static array of `uintptr_t` values — the *geo layout* — through a jump table of command handlers in `src/engine/geo_layout.c`.
+
+## The command interpreter
+
+`process_geo_layout()` in `geo_layout.c` is the entry point. It takes a pool allocator and a segmented pointer to a geo layout array, then walks the array one command at a time, dispatching each opcode through `GeoLayoutJumpTable`:
+
+```c
+typedef void (*GeoLayoutCommandProc)(void);
+
+GeoLayoutCommandProc GeoLayoutJumpTable[] = {
+    geo_layout_cmd_branch_and_link,      // 0x00
+    geo_layout_cmd_end,                  // 0x01
+    geo_layout_cmd_branch,               // 0x02
+    geo_layout_cmd_return,               // 0x03
+    geo_layout_cmd_open_node,            // 0x04
+    geo_layout_cmd_close_node,           // 0x05
+    geo_layout_cmd_assign_as_view,       // 0x06
+    geo_layout_cmd_update_node_flags,    // 0x07
+    geo_layout_cmd_node_root,            // 0x08
+    geo_layout_cmd_node_ortho_projection,// 0x09
+    geo_layout_cmd_node_perspective,     // 0x0A
+    geo_layout_cmd_node_start,           // 0x0B
+    geo_layout_cmd_node_master_list,     // 0x0C
+    geo_layout_cmd_node_level_of_detail, // 0x0D
+    geo_layout_cmd_node_switch_case,     // 0x0E
+    geo_layout_cmd_node_camera,          // 0x0F
+    geo_layout_cmd_node_translation_rotation, // 0x10
+    // …
+};
+```
+
+The global `gGeoLayoutCommand` pointer advances through the array, and a 32-entry stack (`gGeoLayoutStack`) supports branching and subroutine calls between multiple geo layout arrays.
+
+### Key global state
+
+| Variable | Type | Purpose |
+|---|---|---|
+| `gCurRootGraphNode` | `struct GraphNode *` | Root of the currently processed scene graph |
+| `gGraphNodePool` | `struct AllocOnlyPool *` | Memory pool used for all graph node allocations |
+| `gGeoViews` | `struct GraphNode **` | Array of registered camera view nodes |
+| `gGeoLayoutStack` | `uintptr_t[]` | Call/return stack for `GEO_BRANCH_AND_LINK` / `GEO_RETURN` |
+| `gCurGraphNodeList` | `struct GraphNode *[]` | Stack of currently open nodes (parent chain) |
+
+## The GraphNode hierarchy
+
+Every object in the scene tree is a `struct GraphNode` or a struct that embeds one. The base node carries the doubly-linked sibling list and the parent/child pointers that form the tree:
+
+```c
+// Defined implicitly across graph_node.h — the first field of every node type
+struct GraphNode {
+    s16 type;    // GRAPH_NODE_TYPE_* discriminant
+    s16 flags;   // GRAPH_RENDER_* render flags in low byte; drawing layer in hi byte
+    struct GraphNode *prev;
+    struct GraphNode *next;
+    struct GraphNode *parent;
+    struct GraphNode *children;
+};
+```
+
+<Note>
+The **drawing layer** (0–7) is stored in the high byte of `flags`. It controls which of the 8 `GraphNodeMasterList` buckets a display list lands in, and therefore its render mode and draw order.
+</Note>
+
+### Node type constants
+
+```c
+#define GRAPH_NODE_TYPE_ROOT                  0x001
+#define GRAPH_NODE_TYPE_ORTHO_PROJECTION      0x002
+#define GRAPH_NODE_TYPE_PERSPECTIVE          (0x003 | GRAPH_NODE_TYPE_FUNCTIONAL)
+#define GRAPH_NODE_TYPE_MASTER_LIST           0x004
+#define GRAPH_NODE_TYPE_START                 0x00A
+#define GRAPH_NODE_TYPE_LEVEL_OF_DETAIL       0x00B
+#define GRAPH_NODE_TYPE_SWITCH_CASE          (0x00C | GRAPH_NODE_TYPE_FUNCTIONAL)
+#define GRAPH_NODE_TYPE_CAMERA               (0x014 | GRAPH_NODE_TYPE_FUNCTIONAL)
+#define GRAPH_NODE_TYPE_TRANSLATION_ROTATION  0x015
+#define GRAPH_NODE_TYPE_TRANSLATION           0x016
+#define GRAPH_NODE_TYPE_ROTATION              0x017
+#define GRAPH_NODE_TYPE_OBJECT                0x018
+#define GRAPH_NODE_TYPE_ANIMATED_PART         0x019
+#define GRAPH_NODE_TYPE_BILLBOARD             0x01A
+#define GRAPH_NODE_TYPE_DISPLAY_LIST          0x01B
+#define GRAPH_NODE_TYPE_SCALE                 0x01C
+#define GRAPH_NODE_TYPE_SHADOW                0x028
+#define GRAPH_NODE_TYPE_OBJECT_PARENT         0x029
+#define GRAPH_NODE_TYPE_GENERATED_LIST       (0x02A | GRAPH_NODE_TYPE_FUNCTIONAL)
+#define GRAPH_NODE_TYPE_BACKGROUND           (0x02C | GRAPH_NODE_TYPE_FUNCTIONAL)
+#define GRAPH_NODE_TYPE_HELD_OBJ             (0x02E | GRAPH_NODE_TYPE_FUNCTIONAL)
+#define GRAPH_NODE_TYPE_CULLING_RADIUS        0x02F
+```
+
+Types with `GRAPH_NODE_TYPE_FUNCTIONAL` set embed a `GraphNodeFunc` callback that is invoked during rendering, area load/unload, and held-object processing.
+
+### Functional nodes
+
+```c
+typedef Gfx *(*GraphNodeFunc)(s32 callContext, struct GraphNode *node, void *context);
+
+struct FnGraphNode {
+    struct GraphNode node;
+    GraphNodeFunc func;
+};
+```
+
+The `callContext` argument tells the function in which phase it was called:
+
+```c
+#define GEO_CONTEXT_CREATE      0  // node is being built from a geo command
+#define GEO_CONTEXT_RENDER      1  // called from rendering_graph_node.c
+#define GEO_CONTEXT_AREA_UNLOAD 2  // area is being unloaded
+#define GEO_CONTEXT_AREA_LOAD   3  // area is being loaded
+#define GEO_CONTEXT_AREA_INIT   4  // 8 areas are being initialized
+#define GEO_CONTEXT_HELD_OBJ    5  // processing a GraphNodeHeldObject
+```
+
+### Specialized node structs
+
+<Accordion title="GraphNodeRoot — viewport definition">
+```c
+struct GraphNodeRoot {
+    struct GraphNode node;
+    u8  areaIndex;
+    s8  unk15;
+    s16 x;
+    s16 y;
+    s16 width;   // half-width (160)
+    s16 height;  // half-height
+    s16 numViews;
+    struct GraphNode **views;
+};
+```
+</Accordion>
+
+<Accordion title="GraphNodePerspective — 3-D projection frustum">
+```c
+struct GraphNodePerspective {
+    struct FnGraphNode fnNode;
+    s32 unused;
+    f32 fov;   // horizontal FOV in degrees
+    s16 near;  // near clipping plane
+    s16 far;   // far clipping plane
+};
+```
+</Accordion>
+
+<Accordion title="GraphNodeCamera — camera position and aim">
+```c
+struct GraphNodeCamera {
+    struct FnGraphNode fnNode;
+    union {
+        s32 mode;           // assigned on creation
+        struct Camera *camera; // replaced after geo_camera_main runs
+    } config;
+    Vec3f pos;
+    Vec3f focus;
+    Mat4 *matrixPtr;   // look-at matrix
+    s16 roll;
+    s16 rollScreen;
+};
+```
+</Accordion>
+
+<Accordion title="GraphNodeMasterList — 8 rendering buckets">
+```c
+#define GFX_NUM_MASTER_LISTS 8
+
+struct GraphNodeMasterList {
+    struct GraphNode node;
+    struct DisplayListNode *listHeads[GFX_NUM_MASTER_LISTS];
+    struct DisplayListNode *listTails[GFX_NUM_MASTER_LISTS];
+};
+```
+Each bucket corresponds to a rendering layer with its own RDP render mode (opaque, decal, transparent, etc.).
+</Accordion>
+
+<Accordion title="GraphNodeSwitchCase — conditional child selection">
+```c
+struct GraphNodeSwitchCase {
+    struct FnGraphNode fnNode;
+    s32 unused;
+    s16 numCases;
+    s16 selectedCase; // set by func; picks which child to render
+};
+```
+Used for Mario's eye expressions, power-up states, coin rotation frames, and room visibility.
+</Accordion>
+
+<Accordion title="GraphNodeLevelOfDetail — distance culling">
+```c
+struct GraphNodeLevelOfDetail {
+    struct GraphNode node;
+    s16 minDistance;
+    s16 maxDistance;
+};
+```
+Children are only rendered when the camera z-distance to the node is between `minDistance` and `maxDistance`.
+</Accordion>
+
+<Accordion title="GraphNodeAnimatedPart — skeletal animation">
+```c
+struct GraphNodeAnimatedPart {
+    struct GraphNode node;
+    void *displayList;
+    Vec3s translation;
+};
+```
+Reads translation and rotation deltas from the global animation state set when an object node is processed.
+</Accordion>
+
+<Accordion title="GraphNodeShadow">
+```c
+struct GraphNodeShadow {
+    struct GraphNode node;
+    s16 shadowScale;    // diameter or side length of shadow
+    u8  shadowSolidity; // opacity 0–255
+    u8  shadowType;     // shape variant (see shadow.h)
+};
+```
+Every object geo layout begins with a shadow node (when applicable).
+</Accordion>
+
+<Accordion title="GraphNodeCullingRadius — frustum cull override">
+```c
+struct GraphNodeCullingRadius {
+    struct GraphNode node;
+    s16 cullingRadius;
+};
+```
+Overrides the default 300-unit sphere radius used for view-frustum culling. Must be a direct child of the object node. Used for Bowser shockwave rings, tornadoes, and the big eel.
+</Accordion>
+
+## Rendering layers
+
+The drawing layer is encoded in the high byte of a node's `flags` field and is passed as `layer` in many geo macros. Layers map to the 8 master-list buckets, each with a distinct RDP render mode:
+
+| Layer constant | Value | Usage |
+|---|---|---|
+| `LAYER_FORCE` | 0 | Always rendered, no z-buffer |
+| `LAYER_OPAQUE` | 1 | Fully opaque surfaces |
+| `LAYER_OPAQUE_DECAL` | 2 | Opaque with polygon offset |
+| `LAYER_OPAQUE_INTER` | 3 | Opaque inter-objects |
+| `LAYER_ALPHA` | 4 | Alpha-tested (cutout) textures |
+| `LAYER_TRANSPARENT` | 5 | Blended transparency |
+| `LAYER_TRANSPARENT_DECAL` | 6 | Transparent with polygon offset |
+| `LAYER_TRANSPARENT_INTER` | 7 | Transparent inter-objects |
+
+## Geo command macros
+
+The macros in `include/geo_commands.h` expand to packed `uintptr_t` words. Every command starts with an opcode byte, a parameter byte, and a 16-bit field, optionally followed by more words or pointer-sized values.
+
+<Accordion title="Flow control">
+```c
+// 0x00 — Branch, storing return address on the stack
+GEO_BRANCH_AND_LINK(scriptTarget)
+
+// 0x01 — Terminate the geo layout
+GEO_END()
+
+// 0x02 — Unconditional branch (type=1 also pushes return address)
+GEO_BRANCH(type, scriptTarget)
+
+// 0x03 — Return from a GEO_BRANCH_AND_LINK
+GEO_RETURN()
+
+// 0x04 / 0x05 — Push / pop the current node as parent
+GEO_OPEN_NODE()
+GEO_CLOSE_NODE()
+
+// 0x07 — Set, clear, or reset GRAPH_RENDER_* flags on current node
+GEO_UPDATE_NODE_FLAGS(operation, flagBits)
+```
+</Accordion>
+
+<Accordion title="Scene structure nodes">
+```c
+// 0x08 — Screen area / viewport (used as tree root)
+GEO_NODE_SCREEN_AREA(numEntries, x, y, width, height)
+
+// 0x09 — Orthographic projection (skybox)
+GEO_NODE_ORTHO(scale)
+
+// 0x0A — Perspective frustum, optionally with a callback
+GEO_CAMERA_FRUSTUM(fov, near, far)
+GEO_CAMERA_FRUSTUM_WITH_FUNC(fov, near, far, func)
+
+// 0x0B — Generic grouping node (no extra data)
+GEO_NODE_START()
+
+// 0x0C — Enable/disable the z-buffer
+GEO_ZBUFFER(enable)
+
+// 0x0D — Level-of-detail range (camera-space z)
+GEO_RENDER_RANGE(minDistance, maxDistance)
+
+// 0x0E — Switch-case: renders one of N children based on func result
+GEO_SWITCH_CASE(count, function)
+
+// 0x0F — Camera position and aim
+GEO_CAMERA(type, x1, y1, z1, x2, y2, z2, function)
+```
+</Accordion>
+
+<Accordion title="Transform and display list nodes">
+```c
+// 0x10 — Translate + rotate (four fieldLayout variants)
+GEO_TRANSLATE_ROTATE(layer, tx, ty, tz, rx, ry, rz)
+GEO_TRANSLATE_ROTATE_WITH_DL(layer, tx, ty, tz, rx, ry, rz, displayList)
+GEO_TRANSLATE(layer, tx, ty, tz)
+GEO_ROTATE(layer, rx, ry, rz)
+GEO_ROTATE_Y(layer, ry)
+
+// 0x13 — Animated part (uses global animation state)
+GEO_ANIMATED_PART(layer, x, y, z, displayList)
+
+// 0x14 — Billboard (always faces camera)
+GEO_BILLBOARD()
+GEO_BILLBOARD_WITH_PARAMS(layer, tx, ty, tz)
+
+// 0x15 — Plain display list, no transform
+GEO_DISPLAY_LIST(layer, displayList)
+
+// 0x16 — Shadow geometry
+GEO_SHADOW(type, solidity, scale)
+
+// 0x17 — Attach all active object nodes here
+GEO_RENDER_OBJ()
+
+// 0x18 — Dynamically generated display list (function callback)
+GEO_ASM(param, function)
+
+// 0x19 — Skybox background
+GEO_BACKGROUND(background, function)
+GEO_BACKGROUND_COLOR(background)
+
+// 0x1D — Scale a subtree
+GEO_SCALE(layer, scale)
+GEO_SCALE_WITH_DL(layer, scale, displayList)
+
+// 0x20 — Override frustum-culling radius
+GEO_CULLING_RADIUS(cullingRadius)
+```
+</Accordion>
+
+## Real example: Bob-omb Battlefield area 1
+
+The complete area geo layout from `levels/bob/areas/1/geo.inc.c`:
+
+```c
+const GeoLayout bob_geo_000488[] = {
+    GEO_NODE_SCREEN_AREA(10, SCREEN_WIDTH/2, SCREEN_HEIGHT/2, SCREEN_WIDTH/2, SCREEN_HEIGHT/2),
+    GEO_OPEN_NODE(),
+        GEO_ZBUFFER(0),
+        GEO_OPEN_NODE(),
+            GEO_NODE_ORTHO(100),
+            GEO_OPEN_NODE(),
+                GEO_BACKGROUND(BACKGROUND_OCEAN_SKY, geo_skybox_main),
+            GEO_CLOSE_NODE(),
+        GEO_CLOSE_NODE(),
+        GEO_ZBUFFER(1),
+        GEO_OPEN_NODE(),
+            GEO_CAMERA_FRUSTUM_WITH_FUNC(45, 100, 30000, geo_camera_fov),
+            GEO_OPEN_NODE(),
+                GEO_CAMERA(1, 0, 2000, 6000, 3072, 0, -4608, geo_camera_main),
+                GEO_OPEN_NODE(),
+                    GEO_DISPLAY_LIST(LAYER_OPAQUE,            bob_seg7_dl_07004390),
+                    GEO_DISPLAY_LIST(LAYER_OPAQUE,            bob_seg7_dl_07009D80),
+                    GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, bob_seg7_dl_0700A470),
+                    GEO_DISPLAY_LIST(LAYER_ALPHA,             bob_seg7_dl_0700A920),
+                    GEO_DISPLAY_LIST(LAYER_OPAQUE,            bob_seg7_dl_0700DD18),
+                    GEO_DISPLAY_LIST(LAYER_OPAQUE,            bob_seg7_dl_0700E338),
+                    GEO_RENDER_OBJ(),
+                    GEO_ASM(0, geo_envfx_main),
+                GEO_CLOSE_NODE(),
+            GEO_CLOSE_NODE(),
+        GEO_CLOSE_NODE(),
+        GEO_ZBUFFER(0),
+        GEO_OPEN_NODE(),
+            GEO_ASM(0, geo_cannon_circle_base),
+        GEO_CLOSE_NODE(),
+    GEO_CLOSE_NODE(),
+    GEO_END(),
+};
+```
+
+Reading this top-down:
+1. A screen-area root node allocates 12 view slots.
+2. The skybox renders first with z-buffer **off** and an orthographic projection.
+3. The z-buffer is then turned **on** for the 3-D world.
+4. A perspective frustum (45° FOV, near=100, far=30000) sets up the 3-D projection; `geo_camera_fov` adjusts FOV dynamically.
+5. The camera node positions the view; `geo_camera_main` hands it off to the camera system.
+6. Static level display lists are drawn per layer, then `GEO_RENDER_OBJ()` inserts all active objects, and `geo_envfx_main` draws environment effects (snow, bubbles, etc.).
+7. The cannon HUD circle is drawn at the end with z-buffer off again.
+
+## Real example: Chain Chomp Gate actor
+
+From `levels/bob/chain_chomp_gate/geo.inc.c`:
+
+```c
+const GeoLayout bob_geo_000440[] = {
+    GEO_CULLING_RADIUS(1000),
+    GEO_OPEN_NODE(),
+        GEO_DISPLAY_LIST(LAYER_ALPHA, bob_seg7_dl_0700E458),
+    GEO_CLOSE_NODE(),
+    GEO_END(),
+};
+```
+
+This is a minimal actor geo: a 1000-unit culling sphere, one alpha-layer display list as its visual, and termination.
+
+## Real example: Mario face and wings
+
+From `actors/mario/geo.inc.c` — showing `GEO_SWITCH_CASE` and `GEO_ANIMATED_PART` in use:
+
+```c
+const GeoLayout mario_geo_face_and_wings[] = {
+    GEO_ASM(0, geo_mario_head_rotation),
+    GEO_ROTATION_NODE(0x00, 0, 0, 0),
+    GEO_OPEN_NODE(),
+        GEO_SWITCH_CASE(0, geo_switch_mario_cap_on_off),
+        GEO_OPEN_NODE(),
+            GEO_SWITCH_CASE(0, geo_switch_mario_eyes),
+            GEO_OPEN_NODE(),
+                GEO_DISPLAY_LIST(LAYER_OPAQUE, mario_cap_on_eyes_front),
+                GEO_DISPLAY_LIST(LAYER_OPAQUE, mario_cap_on_eyes_half_closed),
+                GEO_DISPLAY_LIST(LAYER_OPAQUE, mario_cap_on_eyes_closed),
+                // … more eye states …
+                GEO_DISPLAY_LIST(LAYER_OPAQUE, mario_cap_on_eyes_dead),
+            GEO_CLOSE_NODE(),
+        GEO_CLOSE_NODE(),
+        GEO_TRANSLATE_ROTATE(0, 142, -51, -126, 22, -40, -135),
+        GEO_OPEN_NODE(),
+            GEO_ASM(0, geo_mario_rotate_wing_cap_wings),
+            GEO_ROTATION_NODE(0x00, 0, 0, 0),
+            GEO_OPEN_NODE(),
+                GEO_DISPLAY_LIST(LAYER_ALPHA, mario_cap_wings),
+            GEO_CLOSE_NODE(),
+        GEO_CLOSE_NODE(),
+    GEO_CLOSE_NODE(),
+    GEO_RETURN(),
+};
+```
+
+`GEO_RETURN()` at the end means this layout was called via `GEO_BRANCH_AND_LINK` from a parent layout and execution returns to it after this block.
+
+## How actors reference geo layouts
+
+Actors (enemies, items, interactive objects) store a pointer to their geo layout in their model data. When `LOAD_MODEL_FROM_GEO` is called in a level script, `process_geo_layout()` interprets that layout to build a shared `GraphNode` tree. Each live object instance temporarily re-parents that shared tree to its own `GraphNodeObject` for rendering, then unparents it — this is the `gGeoViews` / `sharedChild` mechanism described in the comments at the top of `geo_layout.c`.
+
+<Tip>
+To modify how an actor looks at runtime, you generally write a `GraphNodeFunc` callback (attached via `GEO_ASM`) that manipulates the current transformation matrix or swaps display lists based on object state.
+</Tip>

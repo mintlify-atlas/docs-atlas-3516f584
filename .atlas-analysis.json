@@ -1,28 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Super Mario 64 Decompilation",
+  "projectType": "general",
+  "projectName": "Super Mario 64 Decompilation",
+  "projectDescription": "A complete, byte-for-byte matching decompilation of Super Mario 64 for the Nintendo 64, enabling source-level study, modding, and porting of the classic 3D platformer.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#5c64f4",
-    "light": "#acb4fc",
-    "dark": "#ffffff"
-  },
-  "favicon": "https://media.brand.dev/bdf1d847-06bd-4151-b03e-50a3e244afbd.png",
-  "logo": {
-    "light": "https://media.brand.dev/f5cf9483-55db-4419-81cb-331fd5cf7957.svg",
-    "dark": "https://media.brand.dev/f5cf9483-55db-4419-81cb-331fd5cf7957.svg"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/n64decomp/sm64"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/n64decomp/sm64"
-    }
-  },
+  "primaryColor": "#5c64f4",
+  "lightColor": "#acb4fc",
+  "darkColor": "#ffffff",
   "navigation": {
     "tabs": [
       {
@@ -106,5 +89,29 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Full byte-for-byte decompilation matching original N64 ROM for US, JP, EU, Shindou, and iQue versions",
+    "Complete C source code for all game systems including Mario physics, object behaviors, camera, and audio",
+    "Behavior scripting system for defining enemy and object AI",
+    "Level scripting system with geo layout and display list support",
+    "Enhancement patch system for adding features like crash screens, FPS counters, and debug tools",
+    "Multi-version build system supporting gcc and IDO compilers",
+    "Docker support for cross-platform builds",
+    "Doxygen documentation infrastructure"
+  ],
+  "publicApiSurface": [
+    "MarioState struct — full player state including position, velocity, action, and flags",
+    "Object struct — generic game object with behavior script support and collision hitboxes",
+    "BehaviorScript — bytecode language for defining object AI and state machines",
+    "LevelScript — bytecode language for loading and initializing game levels",
+    "GeoLayout — scene graph description language for rendering hierarchy",
+    "Surface struct — collision triangle with terrain type and normal vector",
+    "execute_mario_action() — main Mario action dispatcher",
+    "set_mario_action() — transition Mario to a new action state",
+    "spawn_object() — instantiate a game object from a behavior script",
+    "surface_collision functions — ray casting and floor/wall/ceiling detection",
+    "math_util — Vec3f/Mat4 math utilities for 3D transformations",
+    "Camera system — dynamic camera control with multiple modes"
+  ]
 }

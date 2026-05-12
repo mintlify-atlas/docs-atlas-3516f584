@@ -1,0 +1,103 @@
+---
+title: 'Building SM64 with Docker'
+description: 'Use the official SM64 Docker image to build any ROM version in an isolated Ubuntu container, with examples for macOS and Linux hosts.'
+---
+
+Docker provides a self-contained build environment based on Ubuntu 18.04 with all required dependencies pre-installed. This is useful when you want to avoid installing a MIPS toolchain natively, or when your Linux distribution does not package a compatible version of `binutils-mips`.
+
+The Dockerfile at the root of the repository defines this image. No dependencies beyond Docker itself are required on the host machine.
+
+## Prerequisites
+
+Install and start [Docker](https://www.docker.com/products/docker-desktop/) for your platform before proceeding.
+
+## Build the Docker image
+
+From the root of the cloned `sm64` repository, build the image. This step only needs to be performed once (or again if the `Dockerfile` changes):
+
+```bash
+docker build -t sm64 .
+```
+
+This creates a local image tagged `sm64` based on Ubuntu 18.04 with `binutils-mips-linux-gnu`, `build-essential`, `git`, `pkgconf`, and `python3` pre-installed.
+
+## Place the baserom
+
+Before running the container, copy your original SM64 ROM into the repository directory with the correct version suffix:
+
+```bash
+# Replace us with jp, eu, sh, or cn as needed
+cp /path/to/your/rom.z64 baserom.us.z64
+```
+
+## Run the build
+
+The container requires the repository to be mounted into `/sm64` inside the container. Use the `--mount` flag to bind the current directory:
+
+<CodeGroup>
+
+```bash macOS
+docker run --rm --mount type=bind,source="$(pwd)",destination=/sm64 sm64 make VERSION=us -j4
+```
+
+```bash Linux
+docker run --rm --mount type=bind,source="$(pwd)",destination=/sm64 --user $UID:$GID sm64 make VERSION=us -j4
+```
+
+</CodeGroup>
+
+### The `--user` flag on Linux
+
+On Linux hosts, the Docker daemon runs as root. Without `--user`, all files written by the container — including the output ROM — will be owned by `root`, making them difficult to work with as a normal user.
+
+Passing `--user $UID:$GID` instructs the container to run as your current user and group, so the output files are owned by you.
+
+<Note>
+  macOS handles file ownership differently through Docker Desktop's filesystem virtualization, so `--user` is not required there.
+</Note>
+
+## Build flags
+
+You can pass any `make` variable directly to the container. For example:
+
+<CodeGroup>
+
+```bash Japanese version (macOS)
+docker run --rm --mount type=bind,source="$(pwd)",destination=/sm64 sm64 make VERSION=jp -j4
+```
+
+```bash EU version, skip hash check (Linux)
+docker run --rm --mount type=bind,source="$(pwd)",destination=/sm64 --user $UID:$GID sm64 make VERSION=eu COMPARE=0 -j4
+```
+
+```bash Non-matching build (Linux)
+docker run --rm --mount type=bind,source="$(pwd)",destination=/sm64 --user $UID:$GID sm64 make NON_MATCHING=1 -j4
+```
+
+</CodeGroup>
+
+See the [build options reference](/building/build-options) for a full list of available variables.
+
+## Output
+
+All build artifacts are written to the `build/` directory inside your local repository checkout. The final ROM is located at:
+
+```
+build/<VERSION>/sm64.<VERSION>.z64
+```
+
+Because the repository is bind-mounted, these files appear in your working directory on the host immediately after the build completes — no extraction step is needed.
+
+## Cleaning up
+
+To remove all build artifacts from the host filesystem:
+
+```bash
+docker run --rm --mount type=bind,source="$(pwd)",destination=/sm64 --user $UID:$GID sm64 make clean
+```
+
+To remove the Docker image entirely:
+
+```bash
+docker rmi sm64
+```

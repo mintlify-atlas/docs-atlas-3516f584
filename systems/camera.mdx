@@ -1,0 +1,480 @@
+---
+title: "Camera system: modes, Lakitu, and cutscenes"
+description: "A deep dive into SM64's camera system: the Camera and LakituState structs, all camera modes, C-button input, CameraTriggers, and the cutscene framework."
+---
+
+The camera system in SM64 is one of the largest single files in the codebase (`src/game/camera.c`, over 11,500 lines). It manages everything from the mundane — following Mario around a hill — to the complex: multi-shot cutscenes with spline-interpolated paths, room-transition triggers, FOV shakes, and the handheld-camera effect. The system is designed around a conceptual "Lakitu" entity: a smoothly flying camera operator who tracks a goal position and focus, always approaching them asymptotically rather than snapping instantly.
+
+## Coordinate system and angle conventions
+
+```
+// From the file header comment in camera.c:
+//   +X points right.
+//   +Y points up.
+//   +Z points out of the screen.
+//
+//   pitch: rotation about the X-axis, measured from +Y.
+//          Bounded to +-0x4000 (90 degrees).
+//   yaw:   rotation about the Y-axis, measured from (absolute) +Z.
+//          Positive yaw rotates clockwise, towards +X.
+//   roll:  rotation about the Z-axis (flipped: positive = counterclockwise world).
+```
+
+Angles are stored as `s16` values where 0x10000 = 360°. The macro `DEGREES(x)` converts human-readable degrees:
+
+```c
+#define DEGREES(x) ((x) * 0x10000 / 360)
+```
+
+## Core structs
+
+### `struct Camera` — the logical camera
+
+```c
+struct Camera {
+    u8    mode;        // active camera mode (CAMERA_MODE_*)
+    u8    defMode;     // default mode to return to after special modes
+    s16   yaw;         // direction Mario moves (focus→pos angle, NOT pos→focus!)
+    Vec3f focus;       // target look-at point
+    Vec3f pos;         // camera position
+    Vec3f unusedVec1;
+    f32   areaCenX;    // area rotation centre (x), e.g. the BoB hilltop
+    f32   areaCenZ;    // area rotation centre (z)
+    u8    cutscene;    // currently playing cutscene ID (0 = none)
+    u8    filler1[8];
+    s16   nextYaw;
+    u8    filler2[40];
+    u8    doorStatus;  // DOOR_DEFAULT / DOOR_LEAVING_SPECIAL / DOOR_ENTER_LOBBY
+    f32   areaCenY;    // area centre y, used only when paused
+};
+```
+
+<Warning>
+`camera->yaw` is the angle from `focus` to `pos`, **not** the camera's forward direction. It is effectively the camera's yaw flipped by 180°. Use `vec3f_get_dist_and_angle()` if you need the true forward yaw.
+</Warning>
+
+### `struct LakituState` — the rendered camera
+
+While `Camera` represents the *goal*, `LakituState` is what the renderer actually uses. Lakitu smoothly flies towards his goal each frame:
+
+```c
+struct LakituState {
+    Vec3f curFocus;     // current focus (tracks goalFocus)
+    Vec3f curPos;       // current position (tracks goalPos)
+    Vec3f goalFocus;    // target focus this frame
+    Vec3f goalPos;      // target position this frame
+    // …
+    u8    mode;         // copy of Camera.mode
+    u8    defMode;
+    // …
+    Vec3s shakeMagnitude; // angular offset added by shake effects
+    s16   shakePitchPhase, shakePitchVel, shakePitchDecay;
+    // …
+    s16   roll;         // screen roll for rendering
+    s16   yaw;          // copy of Camera.yaw
+    s16   nextYaw;
+    Vec3f focus;        // ACTUAL rendered focus
+    Vec3f pos;          // ACTUAL rendered position
+    // … shake yaw/roll variables …
+    f32   focHSpeed;    // horizontal speed approaching goalFocus (default 0.8)
+    f32   focVSpeed;    // vertical speed approaching goalFocus (default 0.3)
+    f32   posHSpeed;    // horizontal speed approaching goalPos (default 0.3)
+    f32   posVSpeed;    // vertical speed approaching goalPos (default 0.3)
+    // …
+};
+```
+
+Every frame, `update_lakitu()` moves `curPos` and `curFocus` toward `goalPos` and `goalFocus` using the H/V speed multipliers, then copies the result into `LakituState.pos` and `LakituState.focus`. These are what `geo_camera_main` reads to build the view matrix.
+
+### `struct PlayerCameraState` — Mario's camera-relevant state
+
+```c
+struct PlayerCameraState {
+    u32           action;       // Mario's current action
+    Vec3f         pos;          // Mario's position
+    Vec3s         faceAngle;    // Mario's facing angle
+    Vec3s         headRotation; // head rotation (C-Up)
+    s16           unused;
+    s16           cameraEvent;  // one-shot event flag (door, cannon, star, etc.)
+    struct Object *usedObj;     // object involved in the event
+};
+```
+
+There are two `PlayerCameraState` entries in `gPlayerCameraState[2]` — the second slot was intended for Luigi.
+
+### Key supporting structs
+
+<Accordion title="CameraStoredInfo — saved camera position snapshot">
+```c
+struct CameraStoredInfo {
+    Vec3f pos;
+    Vec3f focus;
+    f32   panDist;
+    f32   cannonYOffset;
+};
+```
+Used to save/restore the camera's state across mode transitions and cutscenes.
+</Accordion>
+
+<Accordion title="TransitionInfo — mode transition interpolation">
+```c
+struct TransitionInfo {
+    s16 posPitch, posYaw;
+    f32 posDist;
+    s16 focPitch, focYaw;
+    f32 focDist;
+    s32 framesLeft;
+    Vec3f marioPos;
+    u8  unused;
+};
+```
+Used by `transition_next_state()` to smoothly interpolate Lakitu between his current and goal positions over a fixed number of frames.
+</Accordion>
+
+<Accordion title="CutsceneSplinePoint — camera path waypoint">
+```c
+struct CutsceneSplinePoint {
+    s8    index; // -1 ends the spline
+    u8    speed; // controls traversal time per segment
+    Vec3s point;
+};
+```
+Arrays of these define the camera paths used in star-collection dances, boss intros, and the ending sequence. `move_point_along_spline()` evaluates the Catmull-Rom spline.
+</Accordion>
+
+<Accordion title="CameraTrigger — spatial camera event zone">
+```c
+struct CameraTrigger {
+    s8  area;        // area index, or -1 for level-wide
+    CameraEvent event;
+    s16 centerX, centerY, centerZ;
+    s16 boundsX, boundsY, boundsZ;
+    s16 boundsYaw;   // rotates the bounding box
+};
+```
+While Mario is inside a trigger's axis-aligned box, its `event` function is called every frame. These control fixed-camera angles in Castle rooms, parallel-tracking segments, and boss-fight framing.
+</Accordion>
+
+<Accordion title="CameraFOVStatus — FOV and shake">
+```c
+struct CameraFOVStatus {
+    u8  fovFunc;          // which preset function sets the base FOV
+    f32 fov;              // current FOV in degrees
+    f32 fovOffset;        // shake offset added to fov
+    u32 unusedIsSleeping;
+    f32 shakeAmplitude;   // range in degrees
+    s16 shakePhase;
+    s16 shakeSpeed;
+    s16 decay;
+};
+```
+</Accordion>
+
+<Accordion title="ParallelTrackingPoint — rail camera path">
+```c
+struct ParallelTrackingPoint {
+    s16   startOfPath;
+    Vec3f pos;
+    f32   distThresh; // how far Mario can stray before camera moves
+    f32   zoom;       // fraction of the way from rail to Mario
+};
+```
+Used by `update_parallel_tracking_camera()` in Rainbow Ride and similar linear paths.
+</Accordion>
+
+## Camera modes
+
+The active mode is stored in `Camera.mode` and `LakituState.mode`. Mode changes go through `set_camera_mode()`, which records `framesLeft` for a smooth transition.
+
+| Constant | Value | Description |
+|---|---|---|
+| `CAMERA_MODE_NONE` | 0x00 | Uninitialized / cutscene override |
+| `CAMERA_MODE_RADIAL` | 0x01 | Standard follow-cam; rotates around `areaCenX/Z` |
+| `CAMERA_MODE_OUTWARD_RADIAL` | 0x02 | Same but pushes outward from the area centre |
+| `CAMERA_MODE_BEHIND_MARIO` | 0x03 | Locks behind Mario's back |
+| `CAMERA_MODE_CLOSE` | 0x04 | Tight follow; used in Castle interiors and BBH |
+| `CAMERA_MODE_C_UP` | 0x06 | First-person look-around (hold C-Up) |
+| `CAMERA_MODE_WATER_SURFACE` | 0x08 | Follows Mario at water-surface height |
+| `CAMERA_MODE_SLIDE_HOOT` | 0x09 | Slide and owl-hoot modes |
+| `CAMERA_MODE_INSIDE_CANNON` | 0x0A | Locked inside cannon |
+| `CAMERA_MODE_BOSS_FIGHT` | 0x0B | Frames both Mario and the boss |
+| `CAMERA_MODE_PARALLEL_TRACKING` | 0x0C | Rail camera along a `ParallelTrackingPoint` path |
+| `CAMERA_MODE_FIXED` | 0x0D | Locked to a single world position |
+| `CAMERA_MODE_8_DIRECTIONS` | 0x0E | 8-direction snap (Bowser courses, Rainbow Ride) |
+| `CAMERA_MODE_FREE_ROAM` | 0x10 | Smooth free-orbit (default outside special areas) |
+| `CAMERA_MODE_SPIRAL_STAIRS` | 0x11 | Hugs the staircase in the Castle |
+
+`set_camera_mode()` signature:
+
+```c
+void set_camera_mode(struct Camera *c, s16 mode, s16 frames);
+```
+
+The `frames` parameter controls how many frames the interpolation from the old position to the new mode's goal takes.
+
+## Key functions
+
+### Initialization and update
+
+```c
+// Called once per level load to zero out and set up the Camera struct
+void init_camera(struct Camera *c);
+
+// Called every frame from the game loop; dispatches to the active mode
+void update_camera(struct Camera *c);
+
+// Hard reset (used after level transitions)
+void reset_camera(struct Camera *c);
+
+// Set the camera to use "Mario cam" (free/8-dir) vs "Lakitu cam" (fixed angles)
+void select_mario_cam_mode(void);
+```
+
+### Geometry and math helpers
+
+```c
+// Approach values asymptotically (smooth follow, no overshoot)
+f32  approach_f32_asymptotic(f32 current, f32 target, f32 multiplier);
+s32  approach_s16_asymptotic(s16 current, s16 target, s16 divisor);
+void approach_vec3f_asymptotic(Vec3f current, Vec3f target,
+                                f32 xMul, f32 yMul, f32 zMul);
+
+// Approach with a fixed linear increment
+s32  camera_approach_f32_symmetric_bool(f32 *current, f32 target, f32 inc);
+s32  camera_approach_s16_symmetric_bool(s16 *current, s16 target, s16 inc);
+
+// Angle calculations
+s16  calculate_pitch(Vec3f from, Vec3f to);
+s16  calculate_yaw(Vec3f from, Vec3f to);
+void calculate_angles(Vec3f from, Vec3f to, s16 *pitch, s16 *yaw);
+f32  calc_abs_dist(Vec3f a, Vec3f b);
+f32  calc_hor_dist(Vec3f a, Vec3f b);
+
+// Rotate a point around an axis
+void rotate_in_xz(Vec3f dst, Vec3f src, s16 yaw);
+void rotate_in_yz(Vec3f dst, Vec3f src, s16 pitch);
+
+// Clamp pitch to avoid gimbal
+s32  clamp_pitch(Vec3f from, Vec3f to, s16 maxPitch, s16 minPitch);
+
+// Slide camera out of geometry
+void resolve_geometry_collisions(Vec3f pos, Vec3f lastGood);
+s32  rotate_camera_around_walls(struct Camera *c, Vec3f cPos,
+                                 s16 *avoidYaw, s16 yawRange);
+```
+
+### Camera shake
+
+Three independent shake axes (pitch, yaw, roll) plus position-based and FOV shakes:
+
+```c
+void set_camera_shake_from_hit(s16 shake);          // SHAKE_ATTACK, SHAKE_LARGE_DAMAGE, etc.
+void set_environmental_camera_shake(s16 shake);     // SHAKE_ENV_EXPLOSION, etc.
+void set_camera_shake_from_point(s16 shake,
+        f32 posX, f32 posY, f32 posZ);              // attenuated by distance
+void set_camera_pitch_shake(s16 mag, s16 decay, s16 inc);
+void set_camera_yaw_shake(s16 mag, s16 decay, s16 inc);
+void set_camera_roll_shake(s16 mag, s16 decay, s16 inc);
+void set_fov_shake(s16 amplitude, s16 decay, s16 shakeSpeed);
+```
+
+### Warp and transition
+
+```c
+// Instantly displace the camera (used when crossing area boundaries)
+void warp_camera(f32 displacementX, f32 displacementY, f32 displacementZ);
+
+// Move Lakitu smoothly between old and new positions over N frames
+void transition_next_state(struct Camera *c, s16 frames);
+
+// Compute the next frame of Lakitu's position from goal deltas
+s16  next_lakitu_state(Vec3f newPos, Vec3f newFoc,
+                       Vec3f curPos, Vec3f curFoc,
+                       Vec3f oldPos, Vec3f oldFoc, s16 yaw);
+```
+
+### Geo graph callbacks
+
+Two functions are exposed to the geo layout system as `GraphNodeFunc` callbacks:
+
+```c
+// Called every frame from the GraphNodeCamera; updates the view matrix
+Gfx *geo_camera_main(s32 callContext, struct GraphNode *g, void *context);
+
+// Called every frame from the GraphNodePerspective; adjusts FOV dynamically
+Gfx *geo_camera_fov(s32 callContext, struct GraphNode *g, void *context);
+```
+
+These are referenced directly in level geo layouts:
+
+```c
+GEO_CAMERA_FRUSTUM_WITH_FUNC(45, 100, 30000, geo_camera_fov),
+GEO_OPEN_NODE(),
+    GEO_CAMERA(1, 0, 2000, 6000, 3072, 0, -4608, geo_camera_main),
+```
+
+## C-button input and camera selection
+
+```c
+// Read C-button presses and translate them to camera rotation flags
+s32  find_c_buttons_pressed(u16 currentState, u16 buttonsPressed, u16 buttonsDown);
+void handle_c_button_movement(struct Camera *c);
+
+// Toggle between Mario-controlled (free/8-dir) and fixed-angle camera
+s32  set_cam_angle(s32 mode);      // CAM_ANGLE_MARIO or CAM_ANGLE_LAKITU
+s32  cam_select_alt_mode(s32 angle);
+```
+
+Movement flags (`gCameraMovementFlags`) track the current C-button state:
+
+```c
+#define CAM_MOVE_RETURN_TO_MIDDLE       0x0001
+#define CAM_MOVE_ZOOMED_OUT             0x0002
+#define CAM_MOVE_ROTATE_RIGHT           0x0004
+#define CAM_MOVE_ROTATE_LEFT            0x0008
+#define CAM_MOVE_FIX_IN_PLACE           0x0040
+#define CAM_MOVE_INIT_CAMERA            0x0800
+#define CAM_MOVE_ALREADY_ZOOMED_OUT     0x1000
+#define CAM_MOVE_C_UP_MODE              0x2000
+#define CAM_MOVE_SUBMERGED              0x4000
+#define CAM_MOVE_PAUSE_SCREEN           0x8000
+```
+
+## The cutscene system
+
+Cutscenes are sequences of `struct Cutscene` entries — each pairing a `CutsceneShot` function with a duration in frames:
+
+```c
+struct Cutscene {
+    CutsceneShot shot;    // function called every frame during this shot
+    s16          duration;
+};
+
+// CUTSCENE_LOOP runs the shot indefinitely; CUTSCENE_STOP ends the cutscene
+#define CUTSCENE_LOOP  0x7FFF
+#define CUTSCENE_STOP  0x8000
+```
+
+`play_cutscene()` selects the right `Cutscene[]` array based on `Camera.cutscene` and steps through shots frame by frame. Within a shot, helper functions schedule one-shot events:
+
+```c
+// Run `event` only during frames [start, end] of the current shot
+s32 cutscene_event(CameraEvent event, struct Camera *c, s16 start, s16 end);
+
+// Spawn an object at a specific frame of the cutscene
+s32 cutscene_spawn_obj(u32 obj, s16 frame);
+```
+
+### Defined cutscenes
+
+A selection of the ~50 defined cutscene IDs:
+
+| Constant | Value | Trigger |
+|---|---|---|
+| `CUTSCENE_DOOR_PULL` | 130 | Pulling a door open |
+| `CUTSCENE_ENTER_CANNON` | 133 | Entering the cannon barrel |
+| `CUTSCENE_ENTER_PAINTING` | 134 | Jumping into a painting |
+| `CUTSCENE_DEATH_EXIT` | 135 | Mario death camera pull-back |
+| `CUTSCENE_INTRO_PEACH` | 142 | Title screen Peach letter |
+| `CUTSCENE_DANCE_ROTATE` | 143 | Star collect: spinning dance |
+| `CUTSCENE_ENTER_BOWSER_ARENA` | 144 | Flying into a Bowser stage |
+| `CUTSCENE_STAR_SPAWN` | 173 | Star appearing after task |
+| `CUTSCENE_GRAND_STAR` | 174 | Grand Star collection |
+| `CUTSCENE_DANCE_DEFAULT` | 175 | Generic star dance |
+| `CUTSCENE_ENDING` | 172 | Credits ending sequence |
+| `CUTSCENE_CREDITS` | 178 | Credits camera |
+
+### Starting a cutscene
+
+```c
+void  start_cutscene(struct Camera *c, u8 cutscene);
+u8    get_cutscene_from_mario_status(struct Camera *c);
+
+// Object-triggered cutscenes
+s16   cutscene_object(u8 cutscene, struct Object *o);
+s16   cutscene_object_with_dialog(u8 cutscene, struct Object *o, s16 dialogID);
+u8    start_object_cutscene_without_focus(u8 cutscene);
+```
+
+### Spline camera paths
+
+Long camera movements (star dances, ending sequence) use `CutsceneSplinePoint[]` arrays and `move_point_along_spline()`:
+
+```c
+s32 move_point_along_spline(Vec3f p,
+                             struct CutsceneSplinePoint spline[],
+                             s16 *splineSegment,
+                             f32 *progress);
+```
+
+Returns 1 when the end of the spline is reached (index = -1 sentinel). The `speed` field of each control point controls how many frames it takes to traverse that segment.
+
+## Handheld-camera shake effect
+
+A separate shake system simulates a handheld camera feel during certain cutscene shots:
+
+```c
+void set_handheld_shake(u8 mode);
+void shake_camera_handheld(Vec3f pos, Vec3f focus);
+```
+
+Modes include `HAND_CAM_SHAKE_CUTSCENE`, `HAND_CAM_SHAKE_HIGH`, `HAND_CAM_SHAKE_STAR_DANCE`, etc. The effect evaluates a `HandheldShakePoint` spline that introduces small random perturbations to the rendered view.
+
+## Floor and ceiling geometry queries
+
+The camera continuously queries surface data to avoid clipping through floors and ceilings:
+
+```c
+void find_mario_floor_and_ceil(struct PlayerGeometry *pg);
+s32  collide_with_walls(Vec3f pos, f32 offsetY, f32 radius);
+s32  is_range_behind_surface(Vec3f from, Vec3f to, struct Surface *surf,
+                              s16 range, s16 surfType);
+```
+
+`struct PlayerGeometry` caches the current and previous floor/ceiling surfaces and their heights for use by the camera mode logic:
+
+```c
+struct PlayerGeometry {
+    struct Surface *currFloor;
+    f32             currFloorHeight;
+    s16             currFloorType;
+    struct Surface *currCeil;
+    s16             currCeilType;
+    f32             currCeilHeight;
+    struct Surface *prevFloor;
+    f32             prevFloorHeight;
+    s16             prevFloorType;
+    struct Surface *prevCeil;
+    f32             prevCeilHeight;
+    s16             prevCeilType;
+    f32             waterHeight;  // recalculated every frame, unused
+};
+```
+
+## In-game camera options and status HUD
+
+```c
+// Update the HUD camera status icons (Lakitu, Mario, fixed angle indicators)
+s32 update_camera_hud_status(struct Camera *c);
+```
+
+Camera status flags (`CAM_STATUS_*`) drive the HUD icons:
+
+```c
+#define CAM_STATUS_MARIO  1 << 0  // Mario-eye icon active
+#define CAM_STATUS_LAKITU 1 << 1  // Lakitu icon active
+#define CAM_STATUS_FIXED  1 << 2  // fixed-camera icon active
+#define CAM_STATUS_C_DOWN 1 << 3  // C-Down zoomed
+#define CAM_STATUS_C_UP   1 << 4  // C-Up first-person
+```
+
+The player toggles between Mario cam and Lakitu cam with the R button. `sSelectionFlags` tracks whether Mario or fixed camera was most recently selected:
+
+```c
+#define CAM_SELECTION_MARIO 1
+#define CAM_SELECTION_FIXED 2
+```
+
+<Tip>
+`camera_course_processing()` is the main per-frame dispatcher for area-specific `CameraTrigger` arrays. If you want to add a fixed-angle zone or parallel-tracking segment to a custom level, add a `CameraTrigger` entry to the level's trigger table and set mode via `set_camera_mode()` inside the event function.
+</Tip>

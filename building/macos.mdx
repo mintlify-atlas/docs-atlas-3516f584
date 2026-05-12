@@ -1,0 +1,144 @@
+---
+title: 'Building SM64 on macOS'
+description: 'Build SM64 on macOS with Homebrew and the mips64-elf-binutils tap using gmake, or use Docker for a fully containerised build without a native MIPS toolchain.'
+---
+
+macOS is supported through two approaches: Homebrew, which installs the MIPS toolchain natively, and Docker, which runs the build inside a pre-configured Ubuntu container. Both produce the same output ROM.
+
+<Note>
+  The version of `make` bundled with macOS (via Xcode Command Line Tools) is too old to build SM64. Both methods below account for this — Homebrew users must invoke `gmake` instead of `make`.
+</Note>
+
+<Tabs>
+  <Tab title="Homebrew">
+    Homebrew is the simplest option if you want to build natively on macOS. The n64-dev tap provides a pre-built `mips64-elf-binutils` bottle for Apple Silicon and Intel Macs.
+
+    <Steps>
+      <Step title="Install Homebrew">
+        If you do not already have Homebrew installed, run the official install script in your terminal:
+
+        ```bash
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        ```
+
+        Follow the on-screen instructions. On Apple Silicon, also follow the steps Homebrew prints to add it to your `PATH`.
+      </Step>
+
+      <Step title="Install build dependencies">
+        Update Homebrew and install the required packages. The `tehzz/n64-dev` tap provides `mips64-elf-binutils`:
+
+        ```bash
+        brew update
+        brew install coreutils make pkg-config tehzz/n64-dev/mips64-elf-binutils
+        ```
+
+        This installs:
+        - `coreutils` — GNU core utilities (provides `sha1sum`, etc.)
+        - `make` — GNU make, accessible as `gmake`
+        - `pkg-config` — build helper used by the Makefile
+        - `mips64-elf-binutils` — MIPS cross-assembler and linker
+      </Step>
+
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/n64decomp/sm64.git
+        cd sm64
+        ```
+      </Step>
+
+      <Step title="Place the baserom">
+        Copy your original SM64 ROM into the project directory with the correct version suffix:
+
+        ```bash
+        # Replace us with jp, eu, sh, or cn as needed
+        cp /path/to/your/rom.z64 baserom.us.z64
+        ```
+      </Step>
+
+      <Step title="Build the ROM">
+        Use `gmake` (Homebrew's GNU make) instead of the system `make`:
+
+        <CodeGroup>
+
+        ```bash Default (US version)
+        gmake
+        ```
+
+        ```bash Japanese version, 4 jobs
+        gmake VERSION=jp -j4
+        ```
+
+        ```bash EU version, skip hash check
+        gmake VERSION=eu COMPARE=0 -j4
+        ```
+
+        </CodeGroup>
+
+        <Warning>
+          Running `make` instead of `gmake` will use the macOS system make, which is too old and will fail with syntax errors. Always use `gmake` on macOS.
+        </Warning>
+
+        Build artifacts are written to the `build/` directory. The final ROM is `build/<VERSION>/sm64.<VERSION>.z64`.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Docker">
+    Docker runs the build inside a Ubuntu 18.04 container that has all dependencies pre-installed. This avoids the need to install any native toolchain and works on both Intel and Apple Silicon Macs (via Rosetta 2 or a compatible Docker image).
+
+    <Steps>
+      <Step title="Install Docker Desktop">
+        Download and install [Docker Desktop for Mac](https://www.docker.com/products/docker-desktop/). Launch Docker Desktop and wait for it to finish starting before continuing.
+      </Step>
+
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/n64decomp/sm64.git
+        cd sm64
+        ```
+      </Step>
+
+      <Step title="Place the baserom">
+        ```bash
+        cp /path/to/your/rom.z64 baserom.us.z64
+        ```
+      </Step>
+
+      <Step title="Build the Docker image">
+        From inside the `sm64` directory, build the image. This only needs to be done once (or when the Dockerfile changes):
+
+        ```bash
+        docker build -t sm64 .
+        ```
+      </Step>
+
+      <Step title="Build the ROM">
+        Mount the current directory into the container and run `make`:
+
+        ```bash
+        docker run --rm --mount type=bind,source="$(pwd)",destination=/sm64 sm64 make VERSION=us -j4
+        ```
+
+        The `--rm` flag removes the container after the build completes. Build artifacts are written to the `build/` directory in your local checkout.
+
+        See the [Docker build guide](/building/docker) for more details on the available flags and the Linux-specific `--user` requirement.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Verifying the build
+
+After a successful build the ROM appears at `build/<VERSION>/sm64.<VERSION>.z64`. The Makefile checks the SHA-1 hash by default (`COMPARE=1`):
+
+| Version | Expected SHA-1 |
+|---------|---------------|
+| `jp` | `8a20a5c83d6ceb0f0506cfc9fa20d8f438cafe51` |
+| `us` | `9bef1128717f958171a4afac3ed78ee2bb4e86ce` |
+| `eu` | `4ac5721683d0e0b6bbb561b58a71740845dceea9` |
+| `sh` | `3f319ae697533a255a1003d09202379d78d5a2e0` |
+| `cn` | `2e1db2780985a1f068077dc0444b685f39cd90ec` |
+
+<Tip>
+  Pass `COMPARE=0` to skip the hash check while making modifications to the codebase. A mismatch is expected when you change any source file.
+</Tip>

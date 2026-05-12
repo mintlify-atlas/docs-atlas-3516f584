@@ -1,0 +1,480 @@
+---
+title: "MarioState: the core player data structure"
+description: "Field-by-field reference for MarioState: position, velocity, action, health, inputs, and collision context — the struct every SM64 system reads every frame."
+---
+
+`MarioState` is the single struct instance (`gMarioState`) that the game reads and writes every frame to represent the player. Every system — movement, collision, animation, camera, audio — reaches into this struct. Understanding its layout is the foundation for reading or modifying any Mario behavior in the decomp.
+
+The global instance is declared in `src/game/level_update.c` and initialised at level load by `init_mario_from_save_file()` followed by `init_mario()`.
+
+```c
+// src/game/mario.h
+s32 execute_mario_action(UNUSED struct Object *o);
+void init_mario(void);
+void init_mario_from_save_file(void);
+```
+
+---
+
+## Type aliases
+
+Before looking at the struct, it helps to know the primitive aliases used throughout the codebase (defined in `include/types.h`):
+
+```c
+typedef f32 Vec2f[2];
+typedef f32 Vec3f[3]; // X, Y, Z, where Y is up
+typedef s16 Vec3s[3];
+typedef s32 Vec3i[3];
+typedef f32 Vec4f[4];
+typedef s16 Vec4s[4];
+
+typedef f32 Mat4[4][4];
+
+typedef s16 Collision; // limited to -32768 to 32767
+typedef TerrainData Vec3Terrain[3]; // s16[3], used for triangle vertices
+```
+
+`Vec3f` is a float triplet with **Y as the vertical axis**. `Vec3s` is the signed-16-bit counterpart used for angles (in N64 angle units where 0x10000 = 360°). `Mat4` is a standard 4×4 row-major float matrix.
+
+---
+
+## Controller struct
+
+Mario reads input through a `Controller` pointer each frame. The raw N64 stick axes are normalised into float ranges.
+
+```c
+// include/types.h  offset 0x00
+struct Controller {
+  /*0x00*/ s16 rawStickX;       //
+  /*0x02*/ s16 rawStickY;       //
+  /*0x04*/ float stickX;        // [-64, 64] positive is right
+  /*0x08*/ float stickY;        // [-64, 64] positive is up
+  /*0x0C*/ float stickMag;      // distance from center [0, 64]
+  /*0x10*/ u16 buttonDown;
+  /*0x12*/ u16 buttonPressed;
+  /*0x14*/ OSContStatus *statusData;
+  /*0x18*/ OSContPad *controllerData;
+};
+```
+
+<ResponseField name="rawStickX / rawStickY" type="s16">
+  Raw signed integer values read directly from the N64 controller hardware before any scaling.
+</ResponseField>
+
+<ResponseField name="stickX / stickY" type="float">
+  Normalised float stick axes in the range `[-64, 64]`. Positive X is right, positive Y is up. These are what action code uses for movement intent.
+</ResponseField>
+
+<ResponseField name="stickMag" type="float">
+  Euclidean distance of the stick from centre, clamped to `[0, 64]`. Used directly as `m->intendedMag` after further scaling.
+</ResponseField>
+
+<ResponseField name="buttonDown" type="u16">
+  Bitmask of all buttons currently held. Common constants: `A_BUTTON`, `B_BUTTON`, `Z_TRIG`, `START_BUTTON`.
+</ResponseField>
+
+<ResponseField name="buttonPressed" type="u16">
+  Bitmask of buttons that transitioned from released to held on this frame. Used for single-press detection (jump, attack).
+</ResponseField>
+
+---
+
+## MarioState struct
+
+The full struct as it appears in `include/types.h`:
+
+```c
+struct MarioState {
+    /*0x00*/ u16 unk00;
+    /*0x02*/ u16 input;
+    /*0x04*/ u32 flags;
+    /*0x08*/ u32 particleFlags;
+    /*0x0C*/ u32 action;
+    /*0x10*/ u32 prevAction;
+    /*0x14*/ u32 terrainSoundAddend;
+    /*0x18*/ u16 actionState;
+    /*0x1A*/ u16 actionTimer;
+    /*0x1C*/ u32 actionArg;
+    /*0x20*/ f32 intendedMag;
+    /*0x24*/ s16 intendedYaw;
+    /*0x26*/ s16 invincTimer;
+    /*0x28*/ u8 framesSinceA;
+    /*0x29*/ u8 framesSinceB;
+    /*0x2A*/ u8 wallKickTimer;
+    /*0x2B*/ u8 doubleJumpTimer;
+    /*0x2C*/ Vec3s faceAngle;
+    /*0x32*/ Vec3s angleVel;
+    /*0x38*/ s16 slideYaw;
+    /*0x3A*/ s16 twirlYaw;
+    /*0x3C*/ Vec3f pos;
+    /*0x48*/ Vec3f vel;
+    /*0x54*/ f32 forwardVel;
+    /*0x58*/ f32 slideVelX;
+    /*0x5C*/ f32 slideVelZ;
+    /*0x60*/ struct Surface *wall;
+    /*0x64*/ struct Surface *ceil;
+    /*0x68*/ struct Surface *floor;
+    /*0x6C*/ f32 ceilHeight;
+    /*0x70*/ f32 floorHeight;
+    /*0x74*/ s16 floorAngle;
+    /*0x76*/ s16 waterLevel;
+    /*0x78*/ struct Object *interactObj;
+    /*0x7C*/ struct Object *heldObj;
+    /*0x80*/ struct Object *usedObj;
+    /*0x84*/ struct Object *riddenObj;
+    /*0x88*/ struct Object *marioObj;
+    /*0x8C*/ struct SpawnInfo *spawnInfo;
+    /*0x90*/ struct Area *area;
+    /*0x94*/ struct PlayerCameraState *statusForCamera;
+    /*0x98*/ struct MarioBodyState *marioBodyState;
+    /*0x9C*/ struct Controller *controller;
+    /*0xA0*/ struct DmaHandlerList *animList;
+    /*0xA4*/ u32 collidedObjInteractTypes;
+    /*0xA8*/ s16 numCoins;
+    /*0xAA*/ s16 numStars;
+    /*0xAC*/ s8 numKeys; // Unused key mechanic
+    /*0xAD*/ s8 numLives;
+    /*0xAE*/ s16 health;
+    /*0xB0*/ s16 unkB0;
+    /*0xB2*/ u8 hurtCounter;
+    /*0xB3*/ u8 healCounter;
+    /*0xB4*/ u8 squishTimer;
+    /*0xB5*/ u8 fadeWarpOpacity;
+    /*0xB6*/ u16 capTimer;
+    /*0xB8*/ s16 prevNumStarsForDialog;
+    /*0xBC*/ f32 peakHeight;
+    /*0xC0*/ f32 quicksandDepth;
+    /*0xC4*/ f32 gettingBlownGravity;
+};
+```
+
+---
+
+## Field groups
+
+### Input and flags
+
+<ResponseField name="input" type="u16 @ 0x02">
+  Processed input bitmask computed each frame from the controller state plus environmental conditions. Key bits (defined in `include/sm64.h`):
+
+  | Constant | Value | Meaning |
+  |---|---|---|
+  | `INPUT_NONZERO_ANALOG` | `0x0001` | Stick deflected past dead zone |
+  | `INPUT_A_PRESSED` | `0x0002` | A button newly pressed this frame |
+  | `INPUT_OFF_FLOOR` | `0x0004` | Mario is airborne |
+  | `INPUT_ABOVE_SLIDE` | `0x0008` | Floor angle exceeds slide threshold |
+  | `INPUT_FIRST_PERSON` | `0x0010` | First-person look mode active |
+  | `INPUT_SQUISHED` | `0x0040` | Mario is being crushed by geometry |
+  | `INPUT_A_DOWN` | `0x0080` | A button held |
+  | `INPUT_IN_POISON_GAS` | `0x0100` | Inside HMC poison gas |
+  | `INPUT_IN_WATER` | `0x0200` | Below water level |
+  | `INPUT_STOMPED` | `0x0400` | Hit by an enemy stomp |
+  | `INPUT_B_PRESSED` | `0x2000` | B button newly pressed this frame |
+  | `INPUT_Z_DOWN` | `0x4000` | Z trigger held |
+  | `INPUT_Z_PRESSED` | `0x8000` | Z trigger newly pressed this frame |
+</ResponseField>
+
+<ResponseField name="flags" type="u32 @ 0x04">
+  Persistent per-frame flags about Mario's state. Key constants from `include/sm64.h`:
+
+  | Constant | Value | Meaning |
+  |---|---|---|
+  | `MARIO_NORMAL_CAP` | `0x00000001` | Wearing the normal cap |
+  | `MARIO_VANISH_CAP` | `0x00000002` | Wearing the vanish cap |
+  | `MARIO_METAL_CAP` | `0x00000004` | Wearing the metal cap |
+  | `MARIO_WING_CAP` | `0x00000008` | Wearing the wing cap |
+  | `MARIO_CAP_ON_HEAD` | `0x00000010` | Cap is on Mario's head |
+  | `MARIO_CAP_IN_HAND` | `0x00000020` | Cap is held in Mario's hand |
+  | `MARIO_TELEPORTING` | `0x00000080` | Mid-teleport |
+  | `MARIO_ACTION_SOUND_PLAYED` | `0x00010000` | Action sound was already played this action |
+  | `MARIO_PUNCHING` | `0x00100000` | Punch animation active |
+  | `MARIO_KICKING` | `0x00200000` | Kick animation active |
+  | `MARIO_TRIPPING` | `0x00400000` | Trip animation active |
+</ResponseField>
+
+<ResponseField name="particleFlags" type="u32 @ 0x08">
+  Bitmask controlling which particle effects spawn this frame. Return value of `execute_mario_action()`. Examples: `PARTICLE_DUST` (`1<<0`), `PARTICLE_SPARKLES` (`1<<3`), `PARTICLE_FIRE` (`1<<11`), `PARTICLE_SNOW` (`1<<14`).
+</ResponseField>
+
+---
+
+### Action system
+
+<ResponseField name="action" type="u32 @ 0x0C">
+  The current action ID. The upper bits encode the group and flags; the lower 9 bits (`ACT_ID_MASK = 0x1FF`) identify the specific action within its group. This value drives the dispatch switch in `execute_mario_action()`.
+</ResponseField>
+
+<ResponseField name="prevAction" type="u32 @ 0x10">
+  The action from the previous frame, saved by `set_mario_action()` before overwriting `action`. Used by jump logic to determine double/triple jump eligibility.
+</ResponseField>
+
+<ResponseField name="actionState" type="u16 @ 0x18">
+  A small integer counter local to the current action. Reset to 0 on every action change. Individual action handlers use it as a sub-state index (e.g. phase 0 = rising, phase 1 = falling).
+</ResponseField>
+
+<ResponseField name="actionTimer" type="u16 @ 0x1A">
+  A frame counter incremented by individual action handlers. Reset to 0 on action change.
+</ResponseField>
+
+<ResponseField name="actionArg" type="u32 @ 0x1C">
+  An arbitrary argument passed to `set_mario_action()` and stored here for the action handler to read. Meaning depends on the action (e.g. lava boost direction, knockback source).
+</ResponseField>
+
+<ResponseField name="terrainSoundAddend" type="u32 @ 0x14">
+  Added to footstep sound IDs to select the correct terrain variant (grass, stone, snow, sand, etc.). Computed each frame from the floor's terrain type bits.
+</ResponseField>
+
+---
+
+### Intended movement (from controller)
+
+<ResponseField name="intendedMag" type="f32 @ 0x20">
+  The desired movement speed derived from the stick magnitude, scaled to game units. Used by walking and airborne code to compute acceleration.
+</ResponseField>
+
+<ResponseField name="intendedYaw" type="s16 @ 0x24">
+  The world-space yaw direction the stick is pointing, in N64 angle units (0x0 = north, 0x4000 = east). Computed from `stickX`/`stickY` plus the camera angle.
+</ResponseField>
+
+---
+
+### Timers and cooldowns
+
+<ResponseField name="invincTimer" type="s16 @ 0x26">
+  Frames of invincibility remaining after taking damage. Counted down each frame.
+</ResponseField>
+
+<ResponseField name="framesSinceA / framesSinceB" type="u8 @ 0x28 / 0x29">
+  Frames elapsed since the A or B button was last pressed. Initialised to `0xFF` (never pressed) and reset to 0 on each press. Used for combo detection.
+</ResponseField>
+
+<ResponseField name="wallKickTimer" type="u8 @ 0x2A">
+  Frames remaining in the wall-kick window after Mario contacts a wall while airborne. Nonzero allows `ACT_WALL_KICK_AIR`.
+</ResponseField>
+
+<ResponseField name="doubleJumpTimer" type="u8 @ 0x2B">
+  Frames remaining in the double/triple jump window after landing. Nonzero enables multi-jump chains.
+</ResponseField>
+
+---
+
+### Orientation and physics
+
+<ResponseField name="faceAngle" type="Vec3s @ 0x2C">
+  Mario's facing orientation as pitch/yaw/roll in N64 angle units. The yaw component (`faceAngle[1]`) is the most frequently written field — it is what determines which direction Mario walks.
+</ResponseField>
+
+<ResponseField name="angleVel" type="Vec3s @ 0x32">
+  Angular velocity for pitch/yaw/roll, used by airborne spinning moves such as twirling.
+</ResponseField>
+
+<ResponseField name="slideYaw" type="s16 @ 0x38">
+  The yaw direction Mario is sliding in during butt/stomach slide actions, separate from `faceAngle`.
+</ResponseField>
+
+<ResponseField name="twirlYaw" type="s16 @ 0x3A">
+  Accumulates rotation during `ACT_TWIRLING`. Separate from `faceAngle` so the facing direction is preserved after the twirl ends.
+</ResponseField>
+
+<ResponseField name="pos" type="Vec3f @ 0x3C">
+  World-space position `{x, y, z}` in game units. Y is the vertical axis. This is the authoritative position used for collision queries and rendering.
+</ResponseField>
+
+<ResponseField name="vel" type="Vec3f @ 0x48">
+  World-space velocity in units/frame. `vel[1]` is the vertical velocity, positive = upward. Gravity is applied by subtracting from `vel[1]` each frame.
+</ResponseField>
+
+<ResponseField name="forwardVel" type="f32 @ 0x54">
+  Signed speed along Mario's facing direction. Positive = forward, negative = backward. This is the primary speed value for ground movement; `vel[0]` and `vel[2]` are recomputed from it each step.
+</ResponseField>
+
+<ResponseField name="slideVelX / slideVelZ" type="f32 @ 0x58 / 0x5C">
+  Separate velocity components used during slide actions (butt slide, stomach slide) where movement direction diverges from facing angle.
+</ResponseField>
+
+---
+
+### Collision references
+
+<ResponseField name="wall" type="struct Surface * @ 0x60">
+  Pointer to the wall surface Mario is currently in contact with, or `NULL`. Updated each frame by the movement step functions.
+</ResponseField>
+
+<ResponseField name="ceil" type="struct Surface * @ 0x64">
+  Pointer to the ceiling surface directly above Mario, or `NULL`.
+</ResponseField>
+
+<ResponseField name="floor" type="struct Surface * @ 0x68">
+  Pointer to the floor surface Mario is standing on or above. **This field must not be `NULL` during action execution**; `execute_mario_action()` returns early if it is (out-of-bounds detection).
+</ResponseField>
+
+<ResponseField name="ceilHeight" type="f32 @ 0x6C">
+  Y coordinate of the ceiling directly above Mario's position. Set to `CELL_HEIGHT_LIMIT` (20000) when no ceiling exists.
+</ResponseField>
+
+<ResponseField name="floorHeight" type="f32 @ 0x70">
+  Y coordinate of the floor surface beneath Mario. Used to determine when Mario is airborne (`pos[1] > floorHeight`).
+</ResponseField>
+
+<ResponseField name="floorAngle" type="s16 @ 0x74">
+  Yaw angle of the steepest descent direction of the current floor, derived from the floor's normal vector. Used to determine slide direction.
+</ResponseField>
+
+<ResponseField name="waterLevel" type="s16 @ 0x76">
+  Y coordinate of the water surface in the current area. Compared against `pos[1]` to decide between swimming and walking states on each frame.
+</ResponseField>
+
+---
+
+### Object references
+
+<ResponseField name="interactObj" type="struct Object * @ 0x78">
+  The object Mario is interacting with this frame (enemy, item, NPC). Cleared between frames.
+</ResponseField>
+
+<ResponseField name="heldObj" type="struct Object * @ 0x7C">
+  The object Mario is currently carrying (`NULL` if not holding anything). Affects which action variants are available (e.g. `ACT_HOLD_WALKING` vs `ACT_WALKING`).
+</ResponseField>
+
+<ResponseField name="usedObj" type="struct Object * @ 0x80">
+  The object Mario is currently using (cannons, doors, signs).
+</ResponseField>
+
+<ResponseField name="riddenObj" type="struct Object * @ 0x84">
+  The object Mario is riding (Yoshi, Koopa shells).
+</ResponseField>
+
+<ResponseField name="marioObj" type="struct Object * @ 0x88">
+  Pointer to Mario's own `Object` node in the object list. Provides access to the graphics node (`marioObj->header.gfx`), animation info, position mirroring, and hitbox data.
+</ResponseField>
+
+<ResponseField name="spawnInfo" type="struct SpawnInfo * @ 0x8C">
+  Spawn point data for the current level entry, including start position and start angle. Read during `init_mario()`.
+</ResponseField>
+
+<ResponseField name="area" type="struct Area * @ 0x90">
+  The current level area. Contains the camera pointer, terrain type, object lists, and warp nodes.
+</ResponseField>
+
+<ResponseField name="statusForCamera" type="struct PlayerCameraState * @ 0x94">
+  Shared state passed to the camera system each frame (position, facing angle, action).
+</ResponseField>
+
+<ResponseField name="marioBodyState" type="struct MarioBodyState * @ 0x98">
+  Controls the visual body pose: cap state, eye state, hand state, torso/head angles, and the held-object last position (HOLP).
+</ResponseField>
+
+<ResponseField name="controller" type="struct Controller * @ 0x9C">
+  Pointer to the `Controller` struct for player 1. Initialised to `&gControllers[0]`.
+</ResponseField>
+
+<ResponseField name="animList" type="struct DmaHandlerList * @ 0xA0">
+  DMA handler for streaming Mario's animations from ROM. Passed to `set_mario_animation()` and `set_mario_anim_with_accel()`.
+</ResponseField>
+
+<ResponseField name="collidedObjInteractTypes" type="u32 @ 0xA4">
+  Bitmask of interaction types from objects that overlapped Mario's hitbox this frame. Drives the interaction system in `mario_process_interactions()`.
+</ResponseField>
+
+---
+
+### Game state (coins, stars, health)
+
+<ResponseField name="numCoins" type="s16 @ 0xA8">
+  Coins collected in the current level session. Displayed on the HUD. Resets between courses.
+</ResponseField>
+
+<ResponseField name="numStars" type="s16 @ 0xAA">
+  Total stars collected across all courses in the save file. Read from the save file on level init.
+</ResponseField>
+
+<ResponseField name="numKeys" type="s8 @ 0xAC">
+  Unused key mechanic left from an earlier design. Always 0 in the shipped game.
+</ResponseField>
+
+<ResponseField name="numLives" type="s8 @ 0xAD">
+  Remaining lives. Initialised to 4. Decremented by death; `numLives == -1` triggers Game Over.
+</ResponseField>
+
+<ResponseField name="health" type="s16 @ 0xAE">
+  Health in units of `0x100` per wedge. Full health is `0x880` (8 wedges + 8 sub-units). The HUD `wedges` field mirrors `health >> 8`. Decremented by damage, incremented by healing.
+</ResponseField>
+
+<ResponseField name="hurtCounter / healCounter" type="u8 @ 0xB2 / 0xB3">
+  Countdown timers driving the hurt and heal animations. Set by `hurt_and_set_mario_action()` and various healing interactions; decremented until they reach 0.
+</ResponseField>
+
+<ResponseField name="squishTimer" type="u8 @ 0xB4">
+  Frames remaining while Mario is squished flat (e.g. crushed by a platform). Forces a shorter hitbox and prevents certain jumps.
+</ResponseField>
+
+<ResponseField name="capTimer" type="u16 @ 0xB6">
+  Frames remaining on a timed special cap (vanish, metal, or wing). Counts down to 0, at which point the cap expires.
+</ResponseField>
+
+<ResponseField name="peakHeight" type="f32 @ 0xBC">
+  The highest Y position Mario has reached during the current airborne phase. Used to calculate fall damage: if `peakHeight - pos[1] > 1150`, Mario takes damage on landing.
+</ResponseField>
+
+<ResponseField name="quicksandDepth" type="f32 @ 0xC0">
+  How far Mario has sunk into quicksand in game units. Incremented while standing on quicksand surfaces; thresholds control when Mario transitions to death or escape actions.
+</ResponseField>
+
+<ResponseField name="gettingBlownGravity" type="f32 @ 0xC4">
+  Custom gravity value applied during `ACT_GETTING_BLOWN` (wind-blown action). Overrides the normal gravitational acceleration for that action.
+</ResponseField>
+
+---
+
+## Reading Mario's position and action
+
+```c
+#include "game/mario.h"
+#include "types.h"
+
+// Access the global Mario state
+extern struct MarioState *gMarioState;
+
+void example_read_mario(void) {
+    struct MarioState *m = gMarioState;
+
+    // World-space position (Y is up)
+    f32 x = m->pos[0];
+    f32 y = m->pos[1];
+    f32 z = m->pos[2];
+
+    // Current action (full 32-bit value including flags)
+    u32 action = m->action;
+
+    // Check if Mario is airborne using action flags
+    if (action & ACT_FLAG_AIR) {
+        // Mario is in an airborne action
+    }
+
+    // Extract the action group
+    u32 group = action & ACT_GROUP_MASK;
+    // e.g. ACT_GROUP_MOVING (0x40), ACT_GROUP_AIRBORNE (0x80), etc.
+
+    // Check specific action
+    if (action == ACT_WALKING) {
+        f32 speed = m->forwardVel;
+    }
+
+    // Read controller input this frame
+    if (m->input & INPUT_A_PRESSED) {
+        // A was pressed; Mario will jump
+    }
+
+    // Check health (0x880 = full, 0x100 per wedge)
+    s16 health = m->health;
+    s32 wedges = health >> 8; // 0–8
+}
+```
+
+<Note>
+  `gMarioState` is a pointer to the first element of the `gMarioStates` array. In the decomp there is only one active player, so `gMarioState == &gMarioStates[0]` always holds.
+</Note>
+
+<Tip>
+  When writing to `pos` or `vel`, also update the mirrored fields on `m->marioObj` (`oPosX/Y/Z`, `header.gfx.pos`) if the change needs to be visible to the renderer and other objects in the same frame. The step functions normally handle this synchronisation, but manual patches may need to do it explicitly.
+</Tip>

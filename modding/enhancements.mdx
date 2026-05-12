@@ -1,0 +1,140 @@
+---
+title: "Enhancement patches: extend SM64 with optional features"
+description: "Apply optional enhancement patches to add crash screens, debug tools, FPS counters, and demo recording to your SM64 build without touching core code."
+---
+
+Enhancement patches are unofficial additions to the SM64 decompilation that provide useful features without being part of the base project. Each patch lives as a `.patch` file inside the `enhancements/` directory and is entirely opt-in — apply only what you need, and revert at any time.
+
+## Applying and reverting patches
+
+Two shell scripts in `tools/` manage the patch lifecycle. Both scripts prompt for confirmation before making any changes.
+
+<Steps>
+  <Step title="Apply a patch">
+    Run `tools/apply_patch.sh` with the path to the `.patch` file you want to enable:
+
+    ```bash
+    tools/apply_patch.sh enhancements/fps.patch
+    ```
+
+    The script runs `patch -p1` against the repository root. After applying, rebuild the ROM normally with `make`.
+  </Step>
+  <Step title="Revert a patch">
+    To undo a previously applied patch, run `tools/revert_patch.sh` with the same file:
+
+    ```bash
+    tools/revert_patch.sh enhancements/fps.patch
+    ```
+
+    The script runs `patch -p1 -R`, reversing all changes made by the patch.
+  </Step>
+</Steps>
+
+<Note>
+  Patches must be applied from the repository root directory. Run the scripts as `tools/apply_patch.sh`, not from inside the `tools/` folder.
+</Note>
+
+## Available enhancements
+
+<CardGroup cols={2}>
+  <Card title="Crash Screen" icon="triangle-exclamation">
+    **`crash.patch`**
+
+    Displays a crash screen when the code throws a hardware exception. Useful for diagnosing crashes in custom game code.
+
+    Frame buffer emulation must be enabled in your emulator. In GlideN64, check **Emulate frame buffer** and **Render frame buffer to output** in the Frame buffer tab. Setting the CPU core style to interpreter gives the best results.
+
+    The patch also exposes a `DEBUG_ASSERT` macro that you can call manually to trigger the crash screen for detected exceptions.
+  </Card>
+  <Card title="FPS Counter" icon="gauge-high">
+    **`fps.patch`**
+
+    Adds an in-game frames-per-second counter to measure render performance. The counter is toggled on and off at runtime by pressing the **L button**.
+
+    The counter is drawn at position (24, 190) on screen and updates once per second using `osGetTime()`. Each OS cycle is treated as approximately 21.33 nanoseconds, matching the N64 SDK documentation.
+  </Card>
+  <Card title="Memory Expansion Pak Error Screen" icon="memory">
+    **`mem_error_screen.patch`**
+
+    When your modified game requires more than 4 MB of RAM and therefore depends on the Expansion Pak, apply this patch to show an error message on startup if the Expansion Pak is not present. Without this patch, the game will crash silently on real hardware without the accessory.
+  </Card>
+  <Card title="Demo Input Recorder" icon="circle-dot">
+    **`record_demo.patch`**
+
+    Records gameplay inputs for the attract-screen demo sequences. Requires the latest nightly build of Project64 and uses the Project64 JavaScript API to dump recorded input data from RAM to disk automatically once a demo is complete.
+
+    See [Demo Input Recorder setup](#demo-input-recorder-setup) below for full instructions.
+  </Card>
+</CardGroup>
+
+### Debug Box
+
+**`debug_box.patch`**
+
+Adds a set of functions that draw semi-transparent 3D boxes directly in the game world, useful for visualising hitboxes, collision bounds, or any spatial region during development.
+
+#### Functions
+
+| Function | Signature | Description |
+|---|---|---|
+| `debug_box` | `(Vec3f center, Vec3f bounds)` | Draws a box from `(center - bounds)` to `(center + bounds)`. |
+| `debug_box_rot` | `(Vec3f center, Vec3f bounds, s16 yaw)` | Same as `debug_box`, but rotates the box in the xz-plane by `yaw`. |
+| `debug_box_pos` | `(Vec3f pMin, Vec3f pMax)` | Draws a box by specifying the minimum and maximum corner points directly. |
+| `debug_box_pos_rot` | `(Vec3f pMin, Vec3f pMax, s16 yaw)` | Same as `debug_box_pos`, but rotates the box in the xz-plane by `yaw`. |
+| `debug_box_color` | `(u32 color)` | Sets the color for subsequent boxes. Format is 32-bit ARGB. If the alpha component is zero, a default alpha of `0x7F` is used. |
+
+#### Usage example
+
+```c
+// Draw a box centred on Mario with half-extents of 50 units on each axis
+Vec3f center = { mario->pos[0], mario->pos[1], mario->pos[2] };
+Vec3f bounds = { 50.0f, 50.0f, 50.0f };
+debug_box(center, bounds);
+
+// Draw a red box using a custom color (ARGB)
+debug_box_color(0xFF FF0000);  // fully opaque red
+debug_box(center, bounds);
+
+// Draw a box from explicit min/max corners, rotated 45 degrees
+Vec3f pMin = { -100.0f, 0.0f, -100.0f };
+Vec3f pMax = {  100.0f, 200.0f, 100.0f };
+debug_box_pos_rot(pMin, pMax, 0x2000); // 0x2000 = 45 degrees in s16 angle units
+```
+
+Up to `MAX_DEBUG_BOXES` (512) boxes can be queued per frame. If you need more, increase that constant in `src/game/debug_box.h`, but be aware that very large counts may exhaust the graphics pool.
+
+## Demo Input Recorder setup
+
+The `record_demo.patch` requires Project64 with JavaScript scripting support. Use the latest nightly build from the Project64 website — stable releases do not include the JavaScript API.
+
+<Steps>
+  <Step title="Install the script">
+    Copy `enhancements/RecordDemo.js` into the `/Scripts/` folder inside your Project64 installation directory.
+  </Step>
+  <Step title="Activate the script">
+    Open the **Scripts** window in Project64 and double-click **RecordDemo** in the list on the left. The entry turns green when the script is active and listening.
+  </Step>
+  <Step title="Record a demo">
+    Launch your ROM in Project64. Press **L** to start recording. The game displays a status indicator on screen:
+
+    | Status text | Meaning |
+    |---|---|
+    | `READY` | Waiting to enter a level |
+    | `REC` | Recording is active |
+    | `WAIT` | Processing final inputs |
+    | `DONE` | Recording complete |
+
+    Press **L** again during `REC` to stop recording early.
+  </Step>
+  <Step title="Retrieve the output">
+    When recording finishes, the JavaScript script dumps the input data from RAM to a newly created `/SM64_DEMOS/` folder inside your Project64 directory. The resulting `.bin` files can be placed in `assets/demos/` and referenced from `assets/demo_data.json`.
+  </Step>
+</Steps>
+
+<Note>
+  The recorder uses the debug level select (`gDebugLevelSelect = TRUE`) so that Mario enters directly into a level rather than through a warp. This matches the format expected by the attract-screen demo playback system.
+</Note>
+
+<Tip>
+  You can create your own enhancement patches using `tools/create_patch.sh`. Switch to the `master` branch, make your changes without committing, then run the script with the desired output filename. See the [Creating patches](/modding/creating-patches) page for a complete workflow.
+</Tip>
